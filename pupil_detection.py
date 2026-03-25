@@ -1,6 +1,6 @@
 """
-人臉瞳孔偵測 (Pupil Detection)
-使用限定的影像處理工具偵測瞳孔位置並計算兩眼瞳孔中心距離。
+人臉瞳孔偵測與五官定位 (Pupil Detection & Facial Feature Localization)
+使用限定的影像處理工具偵測瞳孔位置、五官位置並計算兩眼瞳孔中心距離。
 支援非正面人臉：低頭、側臉、斜視等姿態。
 """
 
@@ -406,11 +406,148 @@ def detect_pupil_in_eye_rect(gray, eye_rect, tracker, eye_label="eye"):
 
 
 # ---------------------------------------------------------------------------
+# 五官偵測
+# ---------------------------------------------------------------------------
+
+def detect_facial_features(gray, face_rect, output, tracker):
+    """
+    偵測五官位置 (眼睛、鼻子、嘴巴) 並在圖上標記。
+    回傳五官位置字典。
+    """
+    fx, fy, fw, fh = face_rect
+    face_roi_gray = gray[fy:fy + fh, fx:fx + fw]
+    features = {}
+
+    # --- 眼睛偵測 ---
+    eye_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_eye.xml"
+    )
+    eyes = eye_cascade.detectMultiScale(face_roi_gray, scaleFactor=1.05,
+                                        minNeighbors=3, minSize=(10, 10))
+    if len(eyes) >= 2:
+        eyes = sorted(eyes, key=lambda e: e[2] * e[3], reverse=True)[:2]
+        eyes = sorted(eyes, key=lambda e: e[0])
+        for i, (ex, ey, ew, eh) in enumerate(eyes):
+            label = "左眼" if i == 0 else "右眼"
+            center = (fx + ex + ew // 2, fy + ey + eh // 2)
+            features[label] = center
+            cv2.rectangle(output, (fx + ex, fy + ey),
+                          (fx + ex + ew, fy + ey + eh), (255, 255, 0), 1)
+            cv2.putText(output, label, (fx + ex, fy + ey - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+
+    # --- 鼻子偵測 ---
+    nose_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_mcs_nose.xml"
+    )
+    # 鼻子在臉的中下區域
+    nose_region_y = int(fh * 0.25)
+    nose_region_h = int(fh * 0.50)
+    nose_roi = face_roi_gray[nose_region_y:nose_region_y + nose_region_h, :]
+    noses = nose_cascade.detectMultiScale(nose_roi, scaleFactor=1.1,
+                                          minNeighbors=3, minSize=(10, 10))
+    if len(noses) > 0:
+        # 取最大的鼻子候選
+        nx, ny, nw, nh = max(noses, key=lambda n: n[2] * n[3])
+        nose_center = (fx + nx + nw // 2, fy + nose_region_y + ny + nh // 2)
+        features["鼻子"] = nose_center
+        cv2.rectangle(output, (fx + nx, fy + nose_region_y + ny),
+                      (fx + nx + nw, fy + nose_region_y + ny + nh),
+                      (0, 255, 255), 1)
+        cv2.putText(output, "Nose", (fx + nx, fy + nose_region_y + ny - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+    else:
+        # Fallback: 用比例估算鼻子位置
+        nose_est = (fx + fw // 2, fy + int(fh * 0.55))
+        features["鼻子"] = nose_est
+        # 用 Sobel 在鼻子區域做邊緣分析驗證
+        nose_area = face_roi_gray[int(fh * 0.35):int(fh * 0.65),
+                                  int(fw * 0.3):int(fw * 0.7)]
+        if nose_area.shape[0] > 5 and nose_area.shape[1] > 5:
+            sobel_edge(nose_area, tracker=tracker)
+        cv2.circle(output, nose_est, 5, (0, 255, 255), 2)
+        cv2.putText(output, "Nose(est)", (nose_est[0] - 20, nose_est[1] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
+    # --- 嘴巴偵測 ---
+    mouth_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_mcs_mouth.xml"
+    )
+    # 嘴巴在臉的下半部
+    mouth_region_y = int(fh * 0.55)
+    mouth_region_h = fh - mouth_region_y
+    mouth_roi = face_roi_gray[mouth_region_y:mouth_region_y + mouth_region_h, :]
+    mouths = mouth_cascade.detectMultiScale(mouth_roi, scaleFactor=1.1,
+                                            minNeighbors=5, minSize=(15, 10))
+    if len(mouths) > 0:
+        mx, my, mw, mh = max(mouths, key=lambda m: m[2] * m[3])
+        mouth_center = (fx + mx + mw // 2, fy + mouth_region_y + my + mh // 2)
+        features["嘴巴"] = mouth_center
+        cv2.rectangle(output, (fx + mx, fy + mouth_region_y + my),
+                      (fx + mx + mw, fy + mouth_region_y + my + mh),
+                      (255, 0, 255), 1)
+        cv2.putText(output, "Mouth", (fx + mx, fy + mouth_region_y + my - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+    else:
+        # Fallback: 比例估算
+        mouth_est = (fx + fw // 2, fy + int(fh * 0.78))
+        features["嘴巴"] = mouth_est
+        cv2.circle(output, mouth_est, 5, (255, 0, 255), 2)
+        cv2.putText(output, "Mouth(est)", (mouth_est[0] - 25, mouth_est[1] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+
+    # --- 眉毛偵測 (使用 Sobel + Contour 在眼睛上方區域) ---
+    eyebrow_region = face_roi_gray[int(fh * 0.08):int(fh * 0.30),
+                                   int(fw * 0.05):int(fw * 0.95)]
+    if eyebrow_region.shape[0] > 5 and eyebrow_region.shape[1] > 5:
+        eb_blurred = gaussian_blur(eyebrow_region, ksize=5, tracker=tracker)
+        eb_edges = sobel_edge(eb_blurred, tracker=tracker)
+        eb_binary = binarization(eb_edges, thresh=40, tracker=tracker)
+        eb_contours = find_contours(eb_binary, tracker=tracker)
+
+        # 篩選水平長條形輪廓作為眉毛候選
+        eb_candidates = []
+        for cnt in eb_contours:
+            x_c, y_c, w_c, h_c = cv2.boundingRect(cnt)
+            aspect = w_c / max(h_c, 1)
+            area = cv2.contourArea(cnt)
+            if aspect > 2.0 and area > 30:
+                eb_candidates.append((x_c, y_c, w_c, h_c))
+
+        if eb_candidates:
+            # 按 x 排序，左半為左眉，右半為右眉
+            eb_candidates.sort(key=lambda c: c[0])
+            eb_offset_x = int(fw * 0.05)
+            eb_offset_y = int(fh * 0.08)
+            for i, (bx, by, bw, bh) in enumerate(eb_candidates[:2]):
+                label = "左眉" if bx < eyebrow_region.shape[1] // 2 else "右眉"
+                eb_center = (fx + eb_offset_x + bx + bw // 2,
+                             fy + eb_offset_y + by + bh // 2)
+                features[label] = eb_center
+                cv2.rectangle(output,
+                              (fx + eb_offset_x + bx, fy + eb_offset_y + by),
+                              (fx + eb_offset_x + bx + bw,
+                               fy + eb_offset_y + by + bh),
+                              (128, 255, 128), 1)
+                cv2.putText(output, label,
+                            (fx + eb_offset_x + bx,
+                             fy + eb_offset_y + by - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (128, 255, 128), 1)
+
+    # 輸出五官位置
+    print("\n--- 五官位置 ---")
+    for name, pos in features.items():
+        print(f"  {name}: ({pos[0]}, {pos[1]})")
+
+    return features
+
+
+# ---------------------------------------------------------------------------
 # 主程式
 # ---------------------------------------------------------------------------
 
 def detect_pupils(image_path):
-    """偵測圖片中的瞳孔並輸出結果。"""
+    """偵測圖片中的瞳孔與五官並輸出結果。"""
     tracker = ToolTracker()
 
     img = cv2.imread(image_path)
@@ -429,6 +566,10 @@ def detect_pupils(image_path):
     right_center_abs = None
     left_radius = 0
     right_radius = 0
+    angle = 0
+    rotated_gray = gray
+    corrected_gray = gray
+    face = None
 
     if result is not None:
         face, angle, rotated_gray = result
@@ -439,6 +580,7 @@ def detect_pupils(image_path):
 
         # ===== 階段 2: Perspective Transform 校正傾斜 =====
         corrected_gray, face = correct_eye_tilt(rotated_gray, face, tracker)
+        fx, fy, fw, fh = face
 
         # ===== 階段 3: Reference Pt 建立眼角參考點 =====
         fx, fy, fw, fh = face
@@ -526,6 +668,26 @@ def detect_pupils(image_path):
             print("錯誤: 未偵測到人臉或眼睛")
             tracker.report()
             sys.exit(1)
+
+    # ===== 階段 6: 五官偵測 =====
+    if result is not None:
+        face_for_features = face
+        gray_for_features = corrected_gray if result is not None else gray
+        # 若有旋轉，在原圖上用原始 face 做五官偵測
+        if angle != 0:
+            # 五官偵測在旋轉校正後的圖上執行，結果畫在 output 上
+            # 需要建一個旋轉後的彩色圖做繪製
+            center = (img_w // 2, img_h // 2)
+            M_rot = cv2.getRotationMatrix2D(center, angle, 1.0)
+            rotated_color = cv2.warpAffine(output, M_rot, (img_w, img_h))
+            features = detect_facial_features(
+                rotated_gray, face, rotated_color, tracker
+            )
+            # 把繪製結果轉回原圖
+            M_inv_full = cv2.getRotationMatrix2D(center, -angle, 1.0)
+            output = cv2.warpAffine(rotated_color, M_inv_full, (img_w, img_h))
+        else:
+            features = detect_facial_features(gray, face, output, tracker)
 
     # ===== 繪製結果 =====
     if left_center_abs is not None:
