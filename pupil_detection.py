@@ -128,6 +128,22 @@ class FakeLandmark:
         self.y = y
 
 
+def estimate_face_direction(face_roi_gray):
+    """Estimate which direction a face is looking by comparing edge density
+    on left vs right halves. The side with MORE edges is where features
+    (nose/mouth) protrude — that's the direction the face is looking."""
+    h, w = face_roi_gray.shape[:2]
+    mid = w // 2
+    left_half = face_roi_gray[:, :mid]
+    right_half = face_roi_gray[:, mid:]
+    # Use Sobel edge density
+    left_edges = cv2.Sobel(left_half, cv2.CV_64F, 1, 0, ksize=3)
+    right_edges = cv2.Sobel(right_half, cv2.CV_64F, 1, 0, ksize=3)
+    left_energy = np.mean(np.abs(left_edges))
+    right_energy = np.mean(np.abs(right_edges))
+    return "left" if left_energy > right_energy else "right"
+
+
 # ---------------------------------------------------------------------------
 # Multi-angle face detection
 # ---------------------------------------------------------------------------
@@ -160,7 +176,7 @@ def detect_face_multi_angle(gray):
             )
             if len(faces) > 0:
                 face = max(faces, key=lambda f: f[2] * f[3])
-                return face, angle, rotated
+                return face, angle, rotated, "frontal", None
 
         for sf, mn in [(1.1, 3), (1.05, 3)]:
             faces = profile_cascade.detectMultiScale(
@@ -168,7 +184,7 @@ def detect_face_multi_angle(gray):
             )
             if len(faces) > 0:
                 face = max(faces, key=lambda f: f[2] * f[3])
-                return face, angle, rotated
+                return face, angle, rotated, "profile", "right"
 
             flipped = cv2.flip(rotated, 1)
             faces = profile_cascade.detectMultiScale(
@@ -178,7 +194,7 @@ def detect_face_multi_angle(gray):
                 face = max(faces, key=lambda f: f[2] * f[3])
                 fx, fy, fw, fh = face
                 face = (w - fx - fw, fy, fw, fh)
-                return face, angle, rotated
+                return face, angle, rotated, "profile", "left"
 
     return None
 
@@ -471,19 +487,209 @@ def detect_pupil_in_roi(roi, tracker, min_pupil_r=4):
 # Facial feature detection
 # ---------------------------------------------------------------------------
 
-def detect_facial_features(gray, face_rect, eyes_in_face, output, tracker):
+def _detect_nose_contour(face_roi_gray, fx, fy, fh, fw, nose_top, nose_bot,
+                         nose_left, nose_right, output, features, tracker):
+    """Use Sobel + Canny + Contour to detect nose tip in given region."""
+    nose_marker_r = max(8, int(fw * 0.03))
+    na = face_roi_gray[nose_top:nose_bot, nose_left:nose_right]
+    if na.shape[0] < 5 or na.shape[1] < 5:
+        return False
+    na_blur = gaussian_blur(na, ksize=7, tracker=tracker)
+    na_sobel = sobel_edge(na_blur, tracker=tracker)
+    na_sobel = gaussian_blur(na_sobel, ksize=5, tracker=tracker)
+    na_canny = canny_edge(na_blur, low=30, high=80, tracker=tracker)
+    na_combined = cv2.bitwise_or(na_sobel, na_canny)
+    na_bin = binarization(na_combined, thresh=40, tracker=tracker)
+    na_cnts = find_contours(na_bin, tracker=tracker)
+    if not na_cnts:
+        return False
+    na_h, na_w = na.shape[:2]
+    na_cx, na_cy = na_w / 2, na_h / 2
+    best_cnt = None
+    best_score = -1
+    for cnt in na_cnts:
+        area = cv2.contourArea(cnt)
+        if area < 20:
+            continue
+        M_c = cv2.moments(cnt)
+        if M_c["m00"] == 0:
+            continue
+        cx_c = M_c["m10"] / M_c["m00"]
+        cy_c = M_c["m01"] / M_c["m00"]
+        dist = math.hypot(cx_c - na_cx, cy_c - na_cy)
+        max_d = math.hypot(na_cx, na_cy)
+        pos = 1 - (dist / max_d) if max_d > 0 else 0
+        score = pos * 0.6 + (area / (na_w * na_h)) * 0.4
+        if score > best_score:
+            best_score = score
+            best_cnt = cnt
+    if best_cnt is None:
+        return False
+    M_c = cv2.moments(best_cnt)
+    ncx = int(M_c["m10"] / M_c["m00"])
+    ncy = int(M_c["m01"] / M_c["m00"])
+    nc = (fx + nose_left + ncx, fy + nose_top + ncy)
+    features["Nose"] = nc
+    cv2.circle(output, nc, nose_marker_r, (0, 255, 255), 2)
+    cv2.putText(output, "Nose", (nc[0] - 20, nc[1] - nose_marker_r - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+    return True
+
+
+def _detect_mouth_contour(face_roi_gray, fx, fy, fw, fh, mry, mouth_left,
+                          mouth_right, output, features, tracker,
+                          min_aspect=1.5):
+    """Use Canny + Contour to detect mouth in given region."""
+    mrh = fh - mry
+    mouth_roi = face_roi_gray[mry:mry + mrh, mouth_left:mouth_right]
+    if mouth_roi.shape[0] < 5 or mouth_roi.shape[1] < 5:
+        return False
+    mb = gaussian_blur(mouth_roi, ksize=5, tracker=tracker)
+    me = canny_edge(mb, low=50, high=120, tracker=tracker)
+    mc_list = find_contours(me, tracker=tracker)
+    best_m = None
+    best_w = 0
+    roi_w = mouth_right - mouth_left
+    for cnt in mc_list:
+        bx, by, bw, bh = cv2.boundingRect(cnt)
+        if bw / max(bh, 1) > min_aspect and bw > roi_w * 0.12 and bw > best_w:
+            best_w = bw
+            best_m = (bx, by, bw, bh)
+    if not best_m:
+        return False
+    bx, by, bw, bh = best_m
+    mc = (fx + mouth_left + bx + bw // 2, fy + mry + by + bh // 2)
+    features["Mouth"] = mc
+    cv2.rectangle(output, (fx + mouth_left + bx, fy + mry + by),
+                  (fx + mouth_left + bx + bw, fy + mry + by + bh),
+                  (255, 0, 255), 1)
+    cv2.putText(output, "Mouth", (fx + mouth_left + bx, fy + mry + by - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+    return True
+
+
+def _detect_eyebrow_above_eye(face_roi_gray, ex, ey, ew, eh, fw,
+                               fx, fy, label, output, features, tracker,
+                               is_cascade_box=True):
+    """Detect eyebrow just above the eye.
+    Strategy: use eye center position + face height to define a narrow
+    search band. Eyebrow is typically 3-6% of face height above eye center.
+    is_cascade_box: True if (ex,ey,ew,eh) is from cascade (includes eyebrow),
+                    False if from contour/estimation (tight around eye only)."""
+    fh = face_roi_gray.shape[0]
+    # Eye center in face ROI coordinates
+    if is_cascade_box:
+        trim_top = int(eh * 0.35)
+        eye_center_y = ey + trim_top + (eh - trim_top) // 2
+    else:
+        eye_center_y = ey + eh // 2
+    # Eyebrow band: 3-8% of face height above the eye center
+    band_h = max(int(fh * 0.06), 10)
+    # Eyebrow center is ~4% of fh above eye center
+    eb_center_y = eye_center_y - max(int(fh * 0.04), 8)
+    eb_top = max(0, eb_center_y - band_h // 2)
+    eb_bot = eb_center_y + band_h // 2
+    pad_x = int(ew * 0.15)
+    eb_left = max(0, ex - pad_x)
+    eb_right = min(fw, ex + ew + pad_x)
+
+    eb_roi = face_roi_gray[eb_top:eb_bot, eb_left:eb_right]
+    if eb_roi.shape[0] < 5 or eb_roi.shape[1] < 5:
+        return False
+
+    eb_b = gaussian_blur(eb_roi, ksize=5, tracker=tracker)
+    eb_s = sobel_edge(eb_b, tracker=tracker)
+    eb_bin = binarization(eb_s, thresh=40, tracker=tracker)
+    eb_cnts = find_contours(eb_bin, tracker=tracker)
+
+    best_eb = None
+    best_w = 0
+    for cnt in eb_cnts:
+        x_c, y_c, w_c, h_c = cv2.boundingRect(cnt)
+        if w_c / max(h_c, 1) > 1.5 and cv2.contourArea(cnt) > 20 and w_c > best_w:
+            best_w = w_c
+            best_eb = (x_c, y_c, w_c, h_c)
+
+    if best_eb is None:
+        return False
+    bx, by, bw, bh = best_eb
+    ec = (fx + eb_left + bx + bw // 2, fy + eb_top + by + bh // 2)
+    features[label] = ec
+    cv2.rectangle(output,
+                  (fx + eb_left + bx, fy + eb_top + by),
+                  (fx + eb_left + bx + bw, fy + eb_top + by + bh),
+                  (128, 255, 128), 1)
+    cv2.putText(output, label,
+                (fx + eb_left + bx, fy + eb_top + by - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (128, 255, 128), 1)
+    return True
+
+
+def _detect_ears(face_roi_gray, fx, fy, fw, fh, output, features, tracker,
+                 sides=None):
+    """Detect ears on specified sides. sides: list of ("left","L-Ear") tuples."""
+    if sides is None:
+        sides = [("left", "L-Ear"), ("right", "R-Ear")]
+    ear_top = int(fh * 0.15)
+    ear_bot = int(fh * 0.65)
+    ear_width = int(fw * 0.25)
+
+    for side, label in sides:
+        if side == "left":
+            ear_roi = face_roi_gray[ear_top:ear_bot, 0:ear_width]
+            ear_ox = 0
+        else:
+            ear_roi = face_roi_gray[ear_top:ear_bot, fw - ear_width:fw]
+            ear_ox = fw - ear_width
+
+        if ear_roi.shape[0] < 5 or ear_roi.shape[1] < 5:
+            continue
+        ear_blur = gaussian_blur(ear_roi, ksize=5, tracker=tracker)
+        ear_sobel = sobel_edge(ear_blur, tracker=tracker)
+        ear_bin = binarization(ear_sobel, thresh=35, tracker=tracker)
+        ear_cnts = find_contours(ear_bin, tracker=tracker)
+
+        if ear_cnts:
+            all_pts = [cnt for cnt in ear_cnts if cv2.contourArea(cnt) > 30]
+            if all_pts:
+                merged = np.vstack(all_pts)
+                rx, ry, rw, rh = cv2.boundingRect(merged)
+                if rh > ear_roi.shape[0] * 0.15 and rw > 5:
+                    ec = (fx + ear_ox + rx + rw // 2, fy + ear_top + ry + rh // 2)
+                    features[label] = ec
+                    cv2.rectangle(output,
+                                  (fx + ear_ox + rx, fy + ear_top + ry),
+                                  (fx + ear_ox + rx + rw, fy + ear_top + ry + rh),
+                                  (255, 128, 0), 2)
+                    cv2.putText(output, label,
+                                (fx + ear_ox + rx, fy + ear_top + ry - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                                (255, 128, 0), 1)
+
+
+def detect_facial_features(gray, face_rect, eyes_in_face, output, tracker,
+                           face_type="frontal", face_direction=None):
     """Detect facial features and draw on output image.
     eyes_in_face: list of (ex, ey, ew, eh) in face ROI coordinates.
+    face_type: "frontal" or "profile"
+    face_direction: "left" or "right" (which way the face is looking) for profile
     """
     fx, fy, fw, fh = face_rect
     face_roi_gray = gray[fy:fy + fh, fx:fx + fw]
     features = {}
 
-    # --- Eyes (trim top 30% of cascade box to exclude eyebrows) ---
+    if face_type == "profile":
+        _detect_facial_features_profile(
+            gray, face_rect, eyes_in_face, output, tracker, face_direction
+        )
+        return features
+
+    # ====== FRONTAL FACE ======
+
+    # --- Eyes (trim top 35% of cascade box to exclude eyebrows) ---
     if len(eyes_in_face) >= 2:
         for i, (ex, ey, ew, eh) in enumerate(eyes_in_face[:2]):
             label = "L-Eye" if i == 0 else "R-Eye"
-            # Trim: keep only lower 65% of cascade box (eye area only)
             trim_top = int(eh * 0.35)
             ey_trimmed = ey + trim_top
             eh_trimmed = eh - trim_top
@@ -496,12 +702,8 @@ def detect_facial_features(gray, face_rect, eyes_in_face, output, tracker):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
 
     # --- Nose detection ---
-    # Strategy: use Gaussian Blur + Sobel + Canny + Contour on nose-tip region
-    # Nose tip is at ~55-75% of face height, center 40% width
     nose_detected = False
-    nose_marker_r = max(8, int(fw * 0.03))  # visible marker size
-
-    # Try cascade first
+    nose_marker_r = max(8, int(fw * 0.03))
     nose_cascade = cv2.CascadeClassifier(
         cv2.data.haarcascades + "haarcascade_mcs_nose.xml"
     )
@@ -513,7 +715,6 @@ def detect_facial_features(gray, face_rect, eyes_in_face, output, tracker):
             noses = nose_cascade.detectMultiScale(nose_roi, 1.1, 3, minSize=(10, 10))
             if len(noses) > 0:
                 nx, ny, nw, nh = max(noses, key=lambda n: n[2] * n[3])
-                # Nose tip = bottom center of cascade box
                 nc = (fx + nx + nw // 2, fy + nose_ry + ny + int(nh * 0.75))
                 features["Nose"] = nc
                 cv2.rectangle(output, (fx + nx, fy + nose_ry + ny),
@@ -525,64 +726,11 @@ def detect_facial_features(gray, face_rect, eyes_in_face, output, tracker):
                 nose_detected = True
 
     if not nose_detected:
-        # Fallback: multi-pass Sobel + Canny on nose-tip region (55-75% height)
-        nose_top = int(fh * 0.50)
-        nose_bot = int(fh * 0.75)
-        nose_left = int(fw * 0.30)
-        nose_right = int(fw * 0.70)
-        na = face_roi_gray[nose_top:nose_bot, nose_left:nose_right]
-        if na.shape[0] > 5 and na.shape[1] > 5:
-            # Pass 1: Gaussian Blur
-            na_blur = gaussian_blur(na, ksize=7, tracker=tracker)
-            # Pass 2: Sobel to find nose ridge edges
-            na_sobel = sobel_edge(na_blur, tracker=tracker)
-            # Pass 3: Gaussian Blur again on Sobel result
-            na_sobel = gaussian_blur(na_sobel, ksize=5, tracker=tracker)
-            # Pass 4: Canny for sharper edges
-            na_canny = canny_edge(na_blur, low=30, high=80, tracker=tracker)
-            # Combine
-            na_combined = cv2.bitwise_or(na_sobel, na_canny)
-            # Pass 5: Binarization
-            na_bin = binarization(na_combined, thresh=40, tracker=tracker)
-            # Pass 6: Contour
-            na_cnts = find_contours(na_bin, tracker=tracker)
-
-            if na_cnts:
-                # Find the most central contour (nose tip)
-                na_h, na_w = na.shape[:2]
-                na_cx, na_cy = na_w / 2, na_h / 2
-                best_cnt = None
-                best_score = -1
-                for cnt in na_cnts:
-                    area = cv2.contourArea(cnt)
-                    if area < 20:
-                        continue
-                    M_c = cv2.moments(cnt)
-                    if M_c["m00"] == 0:
-                        continue
-                    cx_c = M_c["m10"] / M_c["m00"]
-                    cy_c = M_c["m01"] / M_c["m00"]
-                    dist = math.hypot(cx_c - na_cx, cy_c - na_cy)
-                    max_d = math.hypot(na_cx, na_cy)
-                    pos = 1 - (dist / max_d) if max_d > 0 else 0
-                    score = pos * 0.6 + (area / (na_w * na_h)) * 0.4
-                    if score > best_score:
-                        best_score = score
-                        best_cnt = cnt
-
-                if best_cnt is not None:
-                    M_c = cv2.moments(best_cnt)
-                    ncx = int(M_c["m10"] / M_c["m00"])
-                    ncy = int(M_c["m01"] / M_c["m00"])
-                    nc = (fx + nose_left + ncx, fy + nose_top + ncy)
-                    features["Nose"] = nc
-                    cv2.circle(output, nc, nose_marker_r, (0, 255, 255), 2)
-                    cv2.putText(output, "Nose",
-                                (nc[0] - 20, nc[1] - nose_marker_r - 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
-                    nose_detected = True
-
-    # 偵測不到就不標記，不硬猜位置
+        nose_detected = _detect_nose_contour(
+            face_roi_gray, fx, fy, fh, fw,
+            int(fh * 0.50), int(fh * 0.75), int(fw * 0.30), int(fw * 0.70),
+            output, features, tracker
+        )
 
     # --- Mouth (Canny + Contour in lower face) ---
     mouth_detected = False
@@ -606,122 +754,160 @@ def detect_facial_features(gray, face_rect, eyes_in_face, output, tracker):
                 mouth_detected = True
 
     if not mouth_detected:
-        mry = int(fh * 0.60)
-        mrh = fh - mry
-        mouth_roi = face_roi_gray[mry:mry + mrh, :]
-        if mouth_roi.shape[0] > 5 and mouth_roi.shape[1] > 5:
-            mb = gaussian_blur(mouth_roi, ksize=5, tracker=tracker)
-            me = canny_edge(mb, low=50, high=120, tracker=tracker)
-            mc_list = find_contours(me, tracker=tracker)
-            best_m = None
-            best_w = 0
-            for cnt in mc_list:
-                bx, by, bw, bh = cv2.boundingRect(cnt)
-                if bw / max(bh, 1) > 1.5 and bw > fw * 0.15 and bw > best_w:
-                    best_w = bw
-                    best_m = (bx, by, bw, bh)
-            if best_m:
-                bx, by, bw, bh = best_m
-                mc = (fx + bx + bw // 2, fy + mry + by + bh // 2)
-                features["Mouth"] = mc
-                cv2.rectangle(output, (fx + bx, fy + mry + by),
-                              (fx + bx + bw, fy + mry + by + bh), (255, 0, 255), 1)
-                cv2.putText(output, "Mouth", (fx + bx, fy + mry + by - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
-                mouth_detected = True
+        mouth_detected = _detect_mouth_contour(
+            face_roi_gray, fx, fy, fw, fh, int(fh * 0.60), 0, fw,
+            output, features, tracker
+        )
 
-    # 嘴巴偵測不到就不標記
-
-    # --- Eyebrows (Sobel + Contour directly above each detected eye) ---
+    # --- Eyebrows (in upper portion of eye cascade box) ---
     if len(eyes_in_face) >= 2:
         sorted_eyes = sorted(eyes_in_face[:2], key=lambda e: e[0])
         for idx, (ex, ey, ew, eh) in enumerate(sorted_eyes):
             label = "L-Eyebrow" if idx == 0 else "R-Eyebrow"
-            # Eyebrow region: above the eye, same horizontal span with padding
-            eb_h = max(int(eh * 0.6), 8)  # eyebrow height ~60% of eye height
-            eb_top = max(0, ey - eb_h)
-            eb_bot = ey
-            pad_x = int(ew * 0.1)
-            eb_left = max(0, ex - pad_x)
-            eb_right = min(fw, ex + ew + pad_x)
+            _detect_eyebrow_above_eye(face_roi_gray, ex, ey, ew, eh, fw,
+                                       fx, fy, label, output, features, tracker)
 
-            eb_roi = face_roi_gray[eb_top:eb_bot, eb_left:eb_right]
-            if eb_roi.shape[0] < 5 or eb_roi.shape[1] < 5:
-                continue
-
-            eb_b = gaussian_blur(eb_roi, ksize=5, tracker=tracker)
-            eb_s = sobel_edge(eb_b, tracker=tracker)
-            eb_bin = binarization(eb_s, thresh=40, tracker=tracker)
-            eb_cnts = find_contours(eb_bin, tracker=tracker)
-
-            # Find the widest horizontal contour (eyebrow shape)
-            best_eb = None
-            best_w = 0
-            for cnt in eb_cnts:
-                x_c, y_c, w_c, h_c = cv2.boundingRect(cnt)
-                if w_c / max(h_c, 1) > 1.5 and cv2.contourArea(cnt) > 20 and w_c > best_w:
-                    best_w = w_c
-                    best_eb = (x_c, y_c, w_c, h_c)
-
-            if best_eb is not None:
-                bx, by, bw, bh = best_eb
-                ec = (fx + eb_left + bx + bw // 2, fy + eb_top + by + bh // 2)
-                features[label] = ec
-                cv2.rectangle(output,
-                              (fx + eb_left + bx, fy + eb_top + by),
-                              (fx + eb_left + bx + bw, fy + eb_top + by + bh),
-                              (128, 255, 128), 1)
-                cv2.putText(output, label,
-                            (fx + eb_left + bx, fy + eb_top + by - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (128, 255, 128), 1)
-
-    # --- Ears (Sobel + Contour on face sides, bounding rectangle) ---
-    # Ears are at ~15-65% face height, on the outer edges
-    ear_top = int(fh * 0.15)
-    ear_bot = int(fh * 0.65)
-    ear_width = int(fw * 0.25)
-
-    for side, label in [("left", "L-Ear"), ("right", "R-Ear")]:
-        if side == "left":
-            ear_roi = face_roi_gray[ear_top:ear_bot, 0:ear_width]
-            ear_ox = 0
-        else:
-            ear_roi = face_roi_gray[ear_top:ear_bot, fw - ear_width:fw]
-            ear_ox = fw - ear_width
-
-        if ear_roi.shape[0] > 5 and ear_roi.shape[1] > 5:
-            # Gaussian Blur + Sobel + Binarization + Contour
-            ear_blur = gaussian_blur(ear_roi, ksize=5, tracker=tracker)
-            ear_sobel = sobel_edge(ear_blur, tracker=tracker)
-            ear_bin = binarization(ear_sobel, thresh=35, tracker=tracker)
-            ear_cnts = find_contours(ear_bin, tracker=tracker)
-
-            if ear_cnts:
-                # Merge all significant contours to find ear top-to-bottom range
-                all_pts = []
-                for cnt in ear_cnts:
-                    if cv2.contourArea(cnt) > 30:
-                        all_pts.append(cnt)
-
-                if all_pts:
-                    merged = np.vstack(all_pts)
-                    rx, ry, rw, rh = cv2.boundingRect(merged)
-                    # Only mark if bounding box is tall enough (ear is vertically elongated)
-                    if rh > ear_roi.shape[0] * 0.15 and rw > 5:
-                        ec = (fx + ear_ox + rx + rw // 2, fy + ear_top + ry + rh // 2)
-                        features[label] = ec
-                        cv2.rectangle(output,
-                                      (fx + ear_ox + rx, fy + ear_top + ry),
-                                      (fx + ear_ox + rx + rw, fy + ear_top + ry + rh),
-                                      (255, 128, 0), 2)
-                        cv2.putText(output, label,
-                                    (fx + ear_ox + rx, fy + ear_top + ry - 5),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.35,
-                                    (255, 128, 0), 1)
-
-        # 耳朵偵測不到就不標記
+    # --- Ears ---
+    _detect_ears(face_roi_gray, fx, fy, fw, fh, output, features, tracker)
 
     print("\n--- Facial Features ---")
+    for name, pos in features.items():
+        print(f"  {name}: ({pos[0]}, {pos[1]})")
+
+    return features
+
+
+def _detect_facial_features_profile(gray, face_rect, eyes_in_face, output,
+                                     tracker, face_direction):
+    """Detect facial features for profile (side) faces.
+    face_direction: "left" means face is looking left, "right" means looking right.
+    For profile faces detected by haarcascade_profileface:
+      - "right": nose/mouth protrude from the RIGHT edge of the face box
+      - "left": nose/mouth protrude from the LEFT edge of the face box
+    """
+    fx, fy, fw, fh = face_rect
+    face_roi_gray = gray[fy:fy + fh, fx:fx + fw]
+    features = {}
+
+    # Determine which side features are on
+    # Profile cascade for "right-looking" face: nose is on right side of bbox
+    # Profile cascade for "left-looking" face: nose is on left side of bbox
+    nose_side = face_direction  # "left" or "right"
+
+    # --- Eye detection for profile ---
+    # In profile, the visible eye is on the side facing the camera
+    # If face looks right, the visible eye is on the LEFT side of the face box
+    # If face looks left, the visible eye is on the RIGHT side of the face box
+    eye_detected = False
+    if len(eyes_in_face) >= 1:
+        # Use detected eyes
+        for i, (ex, ey, ew, eh) in enumerate(eyes_in_face[:1]):
+            label = "Eye"
+            trim_top = int(eh * 0.35)
+            ey_trimmed = ey + trim_top
+            eh_trimmed = eh - trim_top
+            center = (fx + ex + ew // 2, fy + ey_trimmed + eh_trimmed // 2)
+            features[label] = center
+            cv2.rectangle(output, (fx + ex, fy + ey_trimmed),
+                          (fx + ex + ew, fy + ey_trimmed + eh_trimmed),
+                          (255, 255, 0), 1)
+            cv2.putText(output, label, (fx + ex, fy + ey_trimmed - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+            # Detect eyebrow above this eye
+            _detect_eyebrow_above_eye(face_roi_gray, ex, ey, ew, eh, fw,
+                                       fx, fy, "Eyebrow", output, features, tracker)
+            eye_detected = True
+    else:
+        # Estimate eye position for profile face
+        eye_y_top = int(fh * 0.20)
+        eye_y_bot = int(fh * 0.45)
+        eye_h = eye_y_bot - eye_y_top
+        eye_w = int(fw * 0.35)
+        if nose_side == "right":
+            # Face looks right → eye is in left-center area
+            eye_x = int(fw * 0.15)
+        else:
+            # Face looks left → eye is in right-center area
+            eye_x = int(fw * 0.50)
+
+        # Use darkest region to find eye
+        eye_region = face_roi_gray[eye_y_top:eye_y_bot, eye_x:eye_x + eye_w]
+        if eye_region.shape[0] > 5 and eye_region.shape[1] > 5:
+            eye_blur = gaussian_blur(eye_region, ksize=5, tracker=tracker)
+            eye_bin = binarization(eye_blur, tracker=tracker, use_otsu=True)
+            eye_cnts = find_contours(eye_bin, tracker=tracker)
+
+            best_eye = None
+            best_area = 0
+            for cnt in eye_cnts:
+                area = cv2.contourArea(cnt)
+                if area > best_area and area > 30:
+                    best_area = area
+                    best_eye = cnt
+
+            if best_eye is not None:
+                bx, by, bw, bh = cv2.boundingRect(best_eye)
+                ec = (fx + eye_x + bx + bw // 2, fy + eye_y_top + by + bh // 2)
+                features["Eye"] = ec
+                cv2.rectangle(output,
+                              (fx + eye_x + bx, fy + eye_y_top + by),
+                              (fx + eye_x + bx + bw, fy + eye_y_top + by + bh),
+                              (255, 255, 0), 1)
+                cv2.putText(output, "Eye",
+                            (fx + eye_x + bx, fy + eye_y_top + by - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+                eye_detected = True
+
+                # Detect eyebrow above estimated eye
+                _detect_eyebrow_above_eye(
+                    face_roi_gray, eye_x + bx, eye_y_top + by, bw, bh, fw,
+                    fx, fy, "Eyebrow", output, features, tracker,
+                    is_cascade_box=False
+                )
+
+    # --- Nose detection for profile ---
+    # Nose protrudes from the side the face is looking toward
+    nose_top = int(fh * 0.35)
+    nose_bot = int(fh * 0.65)
+    if nose_side == "right":
+        nose_left = int(fw * 0.50)
+        nose_right = fw
+    else:
+        nose_left = 0
+        nose_right = int(fw * 0.50)
+
+    nose_detected = _detect_nose_contour(
+        face_roi_gray, fx, fy, fh, fw,
+        nose_top, nose_bot, nose_left, nose_right,
+        output, features, tracker
+    )
+
+    # --- Mouth detection for profile ---
+    # Mouth is below nose, shifted toward nose_side
+    mry = int(fh * 0.60)
+    if nose_side == "right":
+        m_left = int(fw * 0.30)
+        m_right = fw
+    else:
+        m_left = 0
+        m_right = int(fw * 0.70)
+
+    _detect_mouth_contour(
+        face_roi_gray, fx, fy, fw, fh, mry, m_left, m_right,
+        output, features, tracker, min_aspect=1.0
+    )
+
+    # --- Ear detection for profile ---
+    # The visible ear is on the OPPOSITE side of where the face is looking
+    # (the ear facing the camera is on the back side of the profile)
+    if nose_side == "right":
+        ear_sides = [("left", "Ear")]
+    else:
+        ear_sides = [("right", "Ear")]
+    _detect_ears(face_roi_gray, fx, fy, fw, fh, output, features, tracker,
+                 sides=ear_sides)
+
+    print("\n--- Facial Features (Profile) ---")
     for name, pos in features.items():
         print(f"  {name}: ({pos[0]}, {pos[1]})")
 
@@ -765,9 +951,11 @@ def detect_pupils(image_path):
     corrected_gray = gray
     face = None
     eyes_in_face = []
+    face_type = "frontal"
+    face_direction = None
 
     if result is not None:
-        face, angle, rotated_gray = result
+        face, angle, rotated_gray, face_type, face_direction = result
         fx, fy, fw, fh = face
 
         if angle != 0:
@@ -801,6 +989,15 @@ def detect_pupils(image_path):
             # Re-detect eyes
             face_roi = corrected_gray[fy:fy + fh, fx:fx + fw]
             eyes_in_face = detect_eyes_in_face(face_roi)
+
+        # Reclassify: if frontal cascade found the face but <2 eyes detected,
+        # treat as profile face
+        if face_type == "frontal" and len(eyes_in_face) < 2:
+            face_type = "profile"
+            face_roi_for_dir = corrected_gray[fy:fy + fh, fx:fx + fw]
+            face_direction = estimate_face_direction(face_roi_for_dir)
+            print(f"Only {len(eyes_in_face)} eye(s) detected, "
+                  f"switching to profile mode (looking {face_direction})")
 
         if len(eyes_in_face) >= 1:
             # Use eye cascade results as precise ROIs
@@ -937,12 +1134,15 @@ def detect_pupils(image_path):
             M_rot = cv2.getRotationMatrix2D(center, angle, 1.0)
             rotated_color = cv2.warpAffine(output, M_rot, (img_w, img_h))
             detect_facial_features(
-                rotated_gray, face, eyes_in_face, rotated_color, tracker
+                rotated_gray, face, eyes_in_face, rotated_color, tracker,
+                face_type=face_type, face_direction=face_direction
             )
             M_inv_full = cv2.getRotationMatrix2D(center, -angle, 1.0)
             output = cv2.warpAffine(rotated_color, M_inv_full, (img_w, img_h))
         else:
-            detect_facial_features(gray, face, eyes_in_face, output, tracker)
+            detect_facial_features(gray, face, eyes_in_face, output, tracker,
+                                   face_type=face_type,
+                                   face_direction=face_direction)
 
     # ===== Draw pupil results =====
     if left_center_abs is not None:
