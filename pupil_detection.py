@@ -495,55 +495,100 @@ def detect_facial_features(gray, face_rect, eyes_in_face, output, tracker):
             cv2.putText(output, label, (fx + ex, fy + ey_trimmed - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
 
-    # --- Nose (Sobel + Contour in center face region) ---
+    # --- Nose detection ---
+    # Strategy: use Gaussian Blur + Sobel + Canny + Contour on nose-tip region
+    # Nose tip is at ~55-75% of face height, center 40% width
     nose_detected = False
+    nose_marker_r = max(8, int(fw * 0.03))  # visible marker size
+
+    # Try cascade first
     nose_cascade = cv2.CascadeClassifier(
         cv2.data.haarcascades + "haarcascade_mcs_nose.xml"
     )
     if not nose_cascade.empty():
-        nose_ry = int(fh * 0.25)
-        nose_rh = int(fh * 0.50)
+        nose_ry = int(fh * 0.30)
+        nose_rh = int(fh * 0.45)
         nose_roi = face_roi_gray[nose_ry:nose_ry + nose_rh, :]
         if nose_roi.shape[0] > 5 and nose_roi.shape[1] > 5:
             noses = nose_cascade.detectMultiScale(nose_roi, 1.1, 3, minSize=(10, 10))
             if len(noses) > 0:
                 nx, ny, nw, nh = max(noses, key=lambda n: n[2] * n[3])
-                nc = (fx + nx + nw // 2, fy + nose_ry + ny + nh // 2)
+                # Nose tip = bottom center of cascade box
+                nc = (fx + nx + nw // 2, fy + nose_ry + ny + int(nh * 0.75))
                 features["Nose"] = nc
                 cv2.rectangle(output, (fx + nx, fy + nose_ry + ny),
-                              (fx + nx + nw, fy + nose_ry + ny + nh), (0, 255, 255), 1)
-                cv2.putText(output, "Nose", (fx + nx, fy + nose_ry + ny - 5),
+                              (fx + nx + nw, fy + nose_ry + ny + nh),
+                              (0, 255, 255), 1)
+                cv2.circle(output, nc, nose_marker_r, (0, 255, 255), 2)
+                cv2.putText(output, "Nose", (nc[0] - 20, nc[1] - nose_marker_r - 5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
                 nose_detected = True
 
     if not nose_detected:
-        # Fallback: Sobel + Contour
-        na = face_roi_gray[int(fh * 0.35):int(fh * 0.65),
-                           int(fw * 0.30):int(fw * 0.70)]
+        # Fallback: multi-pass Sobel + Canny on nose-tip region (55-75% height)
+        nose_top = int(fh * 0.50)
+        nose_bot = int(fh * 0.75)
+        nose_left = int(fw * 0.30)
+        nose_right = int(fw * 0.70)
+        na = face_roi_gray[nose_top:nose_bot, nose_left:nose_right]
         if na.shape[0] > 5 and na.shape[1] > 5:
-            na_blur = gaussian_blur(na, ksize=5, tracker=tracker)
+            # Pass 1: Gaussian Blur
+            na_blur = gaussian_blur(na, ksize=7, tracker=tracker)
+            # Pass 2: Sobel to find nose ridge edges
             na_sobel = sobel_edge(na_blur, tracker=tracker)
-            na_bin = binarization(na_sobel, thresh=30, tracker=tracker)
+            # Pass 3: Gaussian Blur again on Sobel result
+            na_sobel = gaussian_blur(na_sobel, ksize=5, tracker=tracker)
+            # Pass 4: Canny for sharper edges
+            na_canny = canny_edge(na_blur, low=30, high=80, tracker=tracker)
+            # Combine
+            na_combined = cv2.bitwise_or(na_sobel, na_canny)
+            # Pass 5: Binarization
+            na_bin = binarization(na_combined, thresh=40, tracker=tracker)
+            # Pass 6: Contour
             na_cnts = find_contours(na_bin, tracker=tracker)
-            best_cnt = max(na_cnts, key=cv2.contourArea, default=None)
-            if best_cnt is not None:
-                M_c = cv2.moments(best_cnt)
-                if M_c["m00"] > 0:
+
+            if na_cnts:
+                # Find the most central contour (nose tip)
+                na_h, na_w = na.shape[:2]
+                na_cx, na_cy = na_w / 2, na_h / 2
+                best_cnt = None
+                best_score = -1
+                for cnt in na_cnts:
+                    area = cv2.contourArea(cnt)
+                    if area < 20:
+                        continue
+                    M_c = cv2.moments(cnt)
+                    if M_c["m00"] == 0:
+                        continue
+                    cx_c = M_c["m10"] / M_c["m00"]
+                    cy_c = M_c["m01"] / M_c["m00"]
+                    dist = math.hypot(cx_c - na_cx, cy_c - na_cy)
+                    max_d = math.hypot(na_cx, na_cy)
+                    pos = 1 - (dist / max_d) if max_d > 0 else 0
+                    score = pos * 0.6 + (area / (na_w * na_h)) * 0.4
+                    if score > best_score:
+                        best_score = score
+                        best_cnt = cnt
+
+                if best_cnt is not None:
+                    M_c = cv2.moments(best_cnt)
                     ncx = int(M_c["m10"] / M_c["m00"])
                     ncy = int(M_c["m01"] / M_c["m00"])
-                    nc = (fx + int(fw * 0.30) + ncx, fy + int(fh * 0.35) + ncy)
+                    nc = (fx + nose_left + ncx, fy + nose_top + ncy)
                     features["Nose"] = nc
-                    cv2.circle(output, nc, 5, (0, 255, 255), 2)
-                    cv2.putText(output, "Nose", (nc[0] - 15, nc[1] - 10),
+                    cv2.circle(output, nc, nose_marker_r, (0, 255, 255), 2)
+                    cv2.putText(output, "Nose",
+                                (nc[0] - 20, nc[1] - nose_marker_r - 5),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
                     nose_detected = True
 
-        if not nose_detected:
-            nc = (fx + fw // 2, fy + int(fh * 0.55))
-            features["Nose"] = nc
-            cv2.circle(output, nc, 5, (0, 255, 255), 2)
-            cv2.putText(output, "Nose(est)", (nc[0] - 20, nc[1] - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+    if not nose_detected:
+        # Last fallback: proportion estimate (nose tip at 67% height, center)
+        nc = (fx + fw // 2, fy + int(fh * 0.67))
+        features["Nose"] = nc
+        cv2.circle(output, nc, nose_marker_r, (0, 255, 255), 2)
+        cv2.putText(output, "Nose(est)", (nc[0] - 25, nc[1] - nose_marker_r - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
     # --- Mouth (Canny + Contour in lower face) ---
     mouth_detected = False
