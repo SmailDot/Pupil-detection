@@ -582,13 +582,7 @@ def detect_facial_features(gray, face_rect, eyes_in_face, output, tracker):
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
                     nose_detected = True
 
-    if not nose_detected:
-        # Last fallback: proportion estimate (nose tip at 67% height, center)
-        nc = (fx + fw // 2, fy + int(fh * 0.67))
-        features["Nose"] = nc
-        cv2.circle(output, nc, nose_marker_r, (0, 255, 255), 2)
-        cv2.putText(output, "Nose(est)", (nc[0] - 25, nc[1] - nose_marker_r - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+    # 偵測不到就不標記，不硬猜位置
 
     # --- Mouth (Canny + Contour in lower face) ---
     mouth_detected = False
@@ -636,12 +630,7 @@ def detect_facial_features(gray, face_rect, eyes_in_face, output, tracker):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
                 mouth_detected = True
 
-    if not mouth_detected:
-        mc = (fx + fw // 2, fy + int(fh * 0.78))
-        features["Mouth"] = mc
-        cv2.circle(output, mc, 5, (255, 0, 255), 2)
-        cv2.putText(output, "Mouth(est)", (mc[0] - 25, mc[1] - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+    # 嘴巴偵測不到就不標記
 
     # --- Eyebrows (Sobel + Contour above eyes) ---
     eb_region = face_roi_gray[int(fh * 0.05):int(fh * 0.30),
@@ -714,17 +703,7 @@ def detect_facial_features(gray, face_rect, eyes_in_face, output, tracker):
                                     (255, 128, 0), 1)
                         ear_found = True
 
-        if not ear_found:
-            # Fallback: proportion estimate
-            if side == "left":
-                ec = (fx + int(fw * 0.02), fy + int(fh * 0.38))
-            else:
-                ec = (fx + int(fw * 0.98), fy + int(fh * 0.38))
-            features[label] = ec
-            cv2.circle(output, ec, ear_marker_r, (255, 128, 0), 2)
-            cv2.putText(output, f"{label}(est)",
-                        (ec[0] - 25, ec[1] - ear_marker_r - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 128, 0), 1)
+        # 耳朵偵測不到就不標記
 
     print("\n--- Facial Features ---")
     for name, pos in features.items():
