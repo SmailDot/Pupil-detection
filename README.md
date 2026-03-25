@@ -79,9 +79,9 @@ python pupil_detection.py <image_path>
             → Hough 圓偵測 (備援)
         → 五官偵測:
             眼睛: Haar Cascade (多分類器)
-            眉毛: Sobel + Contour (水平長條形篩選)
+            眉毛: 基於眼睛位置定位 + Sobel + Contour (眼睛正上方水平長條形篩選)
             鼻子: Gaussian Blur + Sobel + Canny + Contour (鼻尖區域)
             嘴唇: Canny + Contour (下半臉水平邊緣)
-            耳朵: Sobel + Contour (臉部兩側)
+            耳朵: Sobel + Contour (臉部兩側, 合併輪廓矩形框選)
         → 繪製結果 + 計算瞳孔距離
 ```
