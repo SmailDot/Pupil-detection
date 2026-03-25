@@ -9,6 +9,12 @@ import math
 import cv2
 import numpy as np
 
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
 
 class ToolTracker:
     """記錄每次執行使用的工具順序。"""
@@ -70,6 +76,19 @@ def find_contours(binary_img, tracker=None):
         binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
     return contours
+
+
+def connected_components(binary_img, tracker=None):
+    """Connected Component Labeling — 連通元件標記，作為 Contour 的替代手段。
+    回傳 (num_labels, labels, stats, centroids)。
+    stats 每列: [x, y, w, h, area]
+    """
+    if tracker:
+        tracker.log("Connected Component Labeling")
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        binary_img, connectivity=8
+    )
+    return num_labels, labels, stats, centroids
 
 
 def hough_circles(img, dp=1.2, min_dist=30, param1=100, param2=20,
@@ -177,12 +196,40 @@ def detect_eyes_direct(gray):
     Fallback: 直接偵測眼睛 (不依賴人臉偵測)。
     回傳 [(ex, ey, ew, eh), ...] 眼睛矩形列表。
     """
-    eye_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_eye.xml"
-    )
-    eyes = eye_cascade.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3,
+    all_eyes = []
+    # 嘗試多種 eye cascade 提高偵測率
+    for cascade_name in ["haarcascade_eye.xml",
+                         "haarcascade_lefteye_2splits.xml",
+                         "haarcascade_righteye_2splits.xml",
+                         "haarcascade_eye_tree_eyeglasses.xml"]:
+        cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + cascade_name
+        )
+        if cascade.empty():
+            continue
+        eyes = cascade.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3,
                                         minSize=(15, 15))
-    return eyes
+        if len(eyes) > 0:
+            all_eyes.extend(eyes.tolist())
+        if len(all_eyes) >= 2:
+            break
+
+    # 去重: 合併重疊的偵測結果
+    if len(all_eyes) > 2:
+        all_eyes = sorted(all_eyes, key=lambda e: e[2] * e[3], reverse=True)
+        merged = [all_eyes[0]]
+        for e in all_eyes[1:]:
+            overlap = False
+            for m in merged:
+                if (abs(e[0] - m[0]) < m[2] * 0.5 and
+                        abs(e[1] - m[1]) < m[3] * 0.5):
+                    overlap = True
+                    break
+            if not overlap:
+                merged.append(e)
+        all_eyes = merged
+
+    return np.array(all_eyes) if all_eyes else np.array([])
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +295,11 @@ def correct_eye_tilt(gray, face_rect, tracker):
 
     # 若傾斜角度小於 2 度則不需校正
     if abs(angle) < 2.0:
+        return gray, face_rect
+
+    # 角度超過 35 度視為誤偵測，跳過校正
+    if abs(angle) > 35.0:
+        print(f"眼部傾斜角度 {angle:.1f}° 異常（超過 ±35°），跳過校正")
         return gray, face_rect
 
     print(f"偵測到人臉傾斜 {angle:.1f}°，執行透視校正...")
@@ -380,11 +432,41 @@ def detect_pupil_in_roi(roi, tracker, eye_label="eye"):
                 best_h_score = h_score
                 hough_best = (int(cx), int(cy), max(int(r), 3))
 
-    # 決策: 優先 contour，Hough 備援
+    # 9) Connected Component Labeling 作為第三備援
+    ccl_best = None
+    num_labels, labels, stats, centroids = connected_components(binary, tracker=tracker)
+    if num_labels > 1:
+        best_ccl_score = -1
+        for i in range(1, num_labels):  # 跳過背景 (label 0)
+            area_ccl = stats[i, cv2.CC_STAT_AREA]
+            if area_ccl < 15:
+                continue
+            cx_ccl, cy_ccl = centroids[i]
+            bw = stats[i, cv2.CC_STAT_WIDTH]
+            bh = stats[i, cv2.CC_STAT_HEIGHT]
+            # 估算半徑與圓度
+            r_est = max(int((bw + bh) / 4), 3)
+            if r_est > min(w, h) / 2:
+                continue
+            aspect = min(bw, bh) / max(bw, bh) if max(bw, bh) > 0 else 0
+            # 位置分數
+            dist_ccl = math.hypot(cx_ccl - center_region_x, cy_ccl - center_region_y)
+            pos_ccl = 1 - (dist_ccl / max_dist) if max_dist > 0 else 0
+            # 暗度分數
+            mask_ccl = (labels == i).astype(np.uint8) * 255
+            dark_ccl = 1 - (cv2.mean(roi, mask=mask_ccl)[0] / 255.0)
+            ccl_score = aspect * 0.3 + pos_ccl * 0.35 + dark_ccl * 0.35
+            if ccl_score > best_ccl_score:
+                best_ccl_score = ccl_score
+                ccl_best = (int(cx_ccl), int(cy_ccl), r_est)
+
+    # 決策: 優先 contour，Hough 備援，CCL 第三備援
     if best is not None:
         return best
     if hough_best is not None:
         return hough_best
+    if ccl_best is not None:
+        return ccl_best
     return None
 
 
@@ -436,60 +518,117 @@ def detect_facial_features(gray, face_rect, output, tracker):
             cv2.putText(output, label, (fx + ex, fy + ey - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
 
-    # --- 鼻子偵測 ---
-    nose_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_mcs_nose.xml"
-    )
-    # 鼻子在臉的中下區域
+    # --- 鼻子偵測 (Sobel + Contour 分析鼻樑邊緣) ---
     nose_region_y = int(fh * 0.25)
     nose_region_h = int(fh * 0.50)
     nose_roi = face_roi_gray[nose_region_y:nose_region_y + nose_region_h, :]
-    noses = nose_cascade.detectMultiScale(nose_roi, scaleFactor=1.1,
-                                          minNeighbors=3, minSize=(10, 10))
-    if len(noses) > 0:
-        # 取最大的鼻子候選
-        nx, ny, nw, nh = max(noses, key=lambda n: n[2] * n[3])
-        nose_center = (fx + nx + nw // 2, fy + nose_region_y + ny + nh // 2)
-        features["鼻子"] = nose_center
-        cv2.rectangle(output, (fx + nx, fy + nose_region_y + ny),
-                      (fx + nx + nw, fy + nose_region_y + ny + nh),
-                      (0, 255, 255), 1)
-        cv2.putText(output, "Nose", (fx + nx, fy + nose_region_y + ny - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
-    else:
-        # Fallback: 用比例估算鼻子位置
+    nose_detected = False
+
+    # 嘗試載入 cascade (可能不存在)
+    nose_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_mcs_nose.xml"
+    )
+    if not nose_cascade.empty() and nose_roi.shape[0] > 5 and nose_roi.shape[1] > 5:
+        noses = nose_cascade.detectMultiScale(nose_roi, scaleFactor=1.1,
+                                              minNeighbors=3, minSize=(10, 10))
+        if len(noses) > 0:
+            nx, ny, nw, nh = max(noses, key=lambda n: n[2] * n[3])
+            nose_center = (fx + nx + nw // 2, fy + nose_region_y + ny + nh // 2)
+            features["鼻子"] = nose_center
+            cv2.rectangle(output, (fx + nx, fy + nose_region_y + ny),
+                          (fx + nx + nw, fy + nose_region_y + ny + nh),
+                          (0, 255, 255), 1)
+            cv2.putText(output, "Nose", (fx + nx, fy + nose_region_y + ny - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+            nose_detected = True
+
+    if not nose_detected:
+        # Fallback: Sobel + Contour 偵測鼻樑垂直邊緣
+        nose_area = face_roi_gray[int(fh * 0.30):int(fh * 0.65),
+                                  int(fw * 0.30):int(fw * 0.70)]
+        if nose_area.shape[0] > 5 and nose_area.shape[1] > 5:
+            nose_blur = gaussian_blur(nose_area, ksize=5, tracker=tracker)
+            nose_sobel = sobel_edge(nose_blur, tracker=tracker)
+            nose_bin = binarization(nose_sobel, thresh=30, tracker=tracker)
+            nose_contours = find_contours(nose_bin, tracker=tracker)
+            # 找鼻子中心區域最大的垂直輪廓
+            best_nose_cnt = None
+            best_area = 0
+            for cnt in nose_contours:
+                a = cv2.contourArea(cnt)
+                if a > best_area:
+                    best_area = a
+                    best_nose_cnt = cnt
+            if best_nose_cnt is not None:
+                M_cnt = cv2.moments(best_nose_cnt)
+                if M_cnt["m00"] > 0:
+                    ncx = int(M_cnt["m10"] / M_cnt["m00"])
+                    ncy = int(M_cnt["m01"] / M_cnt["m00"])
+                    nose_center = (fx + int(fw * 0.30) + ncx,
+                                   fy + int(fh * 0.30) + ncy)
+                    features["鼻子"] = nose_center
+                    cv2.circle(output, nose_center, 5, (0, 255, 255), 2)
+                    cv2.putText(output, "Nose", (nose_center[0] - 15, nose_center[1] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                    nose_detected = True
+
+    if not nose_detected:
         nose_est = (fx + fw // 2, fy + int(fh * 0.55))
         features["鼻子"] = nose_est
-        # 用 Sobel 在鼻子區域做邊緣分析驗證
-        nose_area = face_roi_gray[int(fh * 0.35):int(fh * 0.65),
-                                  int(fw * 0.3):int(fw * 0.7)]
-        if nose_area.shape[0] > 5 and nose_area.shape[1] > 5:
-            sobel_edge(nose_area, tracker=tracker)
         cv2.circle(output, nose_est, 5, (0, 255, 255), 2)
         cv2.putText(output, "Nose(est)", (nose_est[0] - 20, nose_est[1] - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
-    # --- 嘴巴偵測 ---
-    mouth_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_mcs_mouth.xml"
-    )
-    # 嘴巴在臉的下半部
+    # --- 嘴巴偵測 (Canny + Contour 分析下半臉邊緣) ---
     mouth_region_y = int(fh * 0.55)
     mouth_region_h = fh - mouth_region_y
     mouth_roi = face_roi_gray[mouth_region_y:mouth_region_y + mouth_region_h, :]
-    mouths = mouth_cascade.detectMultiScale(mouth_roi, scaleFactor=1.1,
-                                            minNeighbors=5, minSize=(15, 10))
-    if len(mouths) > 0:
-        mx, my, mw, mh = max(mouths, key=lambda m: m[2] * m[3])
-        mouth_center = (fx + mx + mw // 2, fy + mouth_region_y + my + mh // 2)
-        features["嘴巴"] = mouth_center
-        cv2.rectangle(output, (fx + mx, fy + mouth_region_y + my),
-                      (fx + mx + mw, fy + mouth_region_y + my + mh),
-                      (255, 0, 255), 1)
-        cv2.putText(output, "Mouth", (fx + mx, fy + mouth_region_y + my - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
-    else:
-        # Fallback: 比例估算
+    mouth_detected = False
+
+    # 嘗試載入 cascade (可能不存在)
+    mouth_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_mcs_mouth.xml"
+    )
+    if not mouth_cascade.empty() and mouth_roi.shape[0] > 5 and mouth_roi.shape[1] > 5:
+        mouths = mouth_cascade.detectMultiScale(mouth_roi, scaleFactor=1.1,
+                                                minNeighbors=5, minSize=(15, 10))
+        if len(mouths) > 0:
+            mx, my, mw, mh = max(mouths, key=lambda m: m[2] * m[3])
+            mouth_center = (fx + mx + mw // 2, fy + mouth_region_y + my + mh // 2)
+            features["嘴巴"] = mouth_center
+            cv2.rectangle(output, (fx + mx, fy + mouth_region_y + my),
+                          (fx + mx + mw, fy + mouth_region_y + my + mh),
+                          (255, 0, 255), 1)
+            cv2.putText(output, "Mouth", (fx + mx, fy + mouth_region_y + my - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+            mouth_detected = True
+
+    if not mouth_detected and mouth_roi.shape[0] > 5 and mouth_roi.shape[1] > 5:
+        # Fallback: Canny + Contour 偵測嘴巴水平邊緣
+        mouth_blur = gaussian_blur(mouth_roi, ksize=5, tracker=tracker)
+        mouth_edges = canny_edge(mouth_blur, low=50, high=120, tracker=tracker)
+        mouth_contours = find_contours(mouth_edges, tracker=tracker)
+        # 找最寬的水平輪廓
+        best_mouth = None
+        best_width = 0
+        for cnt in mouth_contours:
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            aspect = bw / max(bh, 1)
+            if aspect > 1.5 and bw > best_width and bw > fw * 0.15:
+                best_width = bw
+                best_mouth = (bx, by, bw, bh)
+        if best_mouth is not None:
+            bx, by, bw, bh = best_mouth
+            mouth_center = (fx + bx + bw // 2, fy + mouth_region_y + by + bh // 2)
+            features["嘴巴"] = mouth_center
+            cv2.rectangle(output, (fx + bx, fy + mouth_region_y + by),
+                          (fx + bx + bw, fy + mouth_region_y + by + bh),
+                          (255, 0, 255), 1)
+            cv2.putText(output, "Mouth", (fx + bx, fy + mouth_region_y + by - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+            mouth_detected = True
+
+    if not mouth_detected:
         mouth_est = (fx + fw // 2, fy + int(fh * 0.78))
         features["嘴巴"] = mouth_est
         cv2.circle(output, mouth_est, 5, (255, 0, 255), 2)
@@ -551,8 +690,17 @@ def detect_pupils(image_path):
     tracker = ToolTracker()
 
     img = cv2.imread(image_path)
+    if img is None and HAS_PIL:
+        # Fallback: 用 Pillow 讀取 OpenCV 不支援的格式 (如 .avif)
+        try:
+            pil_img = Image.open(image_path).convert("RGB")
+            img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+            print(f"使用 Pillow 讀取圖片 (OpenCV 不支援此格式)")
+        except Exception:
+            pass
     if img is None:
         print(f"錯誤: 無法讀取圖片 '{image_path}'")
+        print("支援格式: jpg, png, bmp, webp (安裝 Pillow 可額外支援 avif 等)")
         sys.exit(1)
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
