@@ -674,6 +674,58 @@ def detect_facial_features(gray, face_rect, eyes_in_face, output, tracker):
                             (fx + ox + bx, fy + oy + by - 5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.35, (128, 255, 128), 1)
 
+    # --- Ears (Sobel + Contour on face sides) ---
+    ear_marker_r = max(6, int(fw * 0.02))
+    # Ears are at ~25-55% face height, on the outer edges
+    ear_top = int(fh * 0.20)
+    ear_bot = int(fh * 0.60)
+    ear_width = int(fw * 0.20)
+
+    for side, label in [("left", "L-Ear"), ("right", "R-Ear")]:
+        if side == "left":
+            ear_roi = face_roi_gray[ear_top:ear_bot, 0:ear_width]
+            ear_ox = 0
+        else:
+            ear_roi = face_roi_gray[ear_top:ear_bot, fw - ear_width:fw]
+            ear_ox = fw - ear_width
+
+        ear_found = False
+        if ear_roi.shape[0] > 5 and ear_roi.shape[1] > 5:
+            # Gaussian Blur + Sobel + Binarization + Contour
+            ear_blur = gaussian_blur(ear_roi, ksize=5, tracker=tracker)
+            ear_sobel = sobel_edge(ear_blur, tracker=tracker)
+            ear_bin = binarization(ear_sobel, thresh=35, tracker=tracker)
+            ear_cnts = find_contours(ear_bin, tracker=tracker)
+
+            # Find largest contour in ear region
+            if ear_cnts:
+                best_ear = max(ear_cnts, key=cv2.contourArea)
+                if cv2.contourArea(best_ear) > 50:
+                    M_e = cv2.moments(best_ear)
+                    if M_e["m00"] > 0:
+                        ecx = int(M_e["m10"] / M_e["m00"])
+                        ecy = int(M_e["m01"] / M_e["m00"])
+                        ec = (fx + ear_ox + ecx, fy + ear_top + ecy)
+                        features[label] = ec
+                        cv2.circle(output, ec, ear_marker_r, (255, 128, 0), 2)
+                        cv2.putText(output, label,
+                                    (ec[0] - 20, ec[1] - ear_marker_r - 5),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                                    (255, 128, 0), 1)
+                        ear_found = True
+
+        if not ear_found:
+            # Fallback: proportion estimate
+            if side == "left":
+                ec = (fx + int(fw * 0.02), fy + int(fh * 0.38))
+            else:
+                ec = (fx + int(fw * 0.98), fy + int(fh * 0.38))
+            features[label] = ec
+            cv2.circle(output, ec, ear_marker_r, (255, 128, 0), 2)
+            cv2.putText(output, f"{label}(est)",
+                        (ec[0] - 25, ec[1] - ear_marker_r - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 128, 0), 1)
+
     print("\n--- Facial Features ---")
     for name, pos in features.items():
         print(f"  {name}: ({pos[0]}, {pos[1]})")
