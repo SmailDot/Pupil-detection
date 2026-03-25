@@ -632,43 +632,54 @@ def detect_facial_features(gray, face_rect, eyes_in_face, output, tracker):
 
     # 嘴巴偵測不到就不標記
 
-    # --- Eyebrows (Sobel + Contour above eyes) ---
-    eb_region = face_roi_gray[int(fh * 0.05):int(fh * 0.30),
-                              int(fw * 0.05):int(fw * 0.95)]
-    if eb_region.shape[0] > 5 and eb_region.shape[1] > 5:
-        eb_b = gaussian_blur(eb_region, ksize=5, tracker=tracker)
-        eb_s = sobel_edge(eb_b, tracker=tracker)
-        eb_bin = binarization(eb_s, thresh=40, tracker=tracker)
-        eb_cnts = find_contours(eb_bin, tracker=tracker)
+    # --- Eyebrows (Sobel + Contour directly above each detected eye) ---
+    if len(eyes_in_face) >= 2:
+        sorted_eyes = sorted(eyes_in_face[:2], key=lambda e: e[0])
+        for idx, (ex, ey, ew, eh) in enumerate(sorted_eyes):
+            label = "L-Eyebrow" if idx == 0 else "R-Eyebrow"
+            # Eyebrow region: above the eye, same horizontal span with padding
+            eb_h = max(int(eh * 0.6), 8)  # eyebrow height ~60% of eye height
+            eb_top = max(0, ey - eb_h)
+            eb_bot = ey
+            pad_x = int(ew * 0.1)
+            eb_left = max(0, ex - pad_x)
+            eb_right = min(fw, ex + ew + pad_x)
 
-        eb_cands = []
-        for cnt in eb_cnts:
-            x_c, y_c, w_c, h_c = cv2.boundingRect(cnt)
-            if w_c / max(h_c, 1) > 2.0 and cv2.contourArea(cnt) > 30:
-                eb_cands.append((x_c, y_c, w_c, h_c))
+            eb_roi = face_roi_gray[eb_top:eb_bot, eb_left:eb_right]
+            if eb_roi.shape[0] < 5 or eb_roi.shape[1] < 5:
+                continue
 
-        if eb_cands:
-            eb_cands.sort(key=lambda c: c[0])
-            ox = int(fw * 0.05)
-            oy = int(fh * 0.05)
-            for i, (bx, by, bw, bh) in enumerate(eb_cands[:2]):
-                label = "L-Brow" if bx < eb_region.shape[1] // 2 else "R-Brow"
-                ec = (fx + ox + bx + bw // 2, fy + oy + by + bh // 2)
+            eb_b = gaussian_blur(eb_roi, ksize=5, tracker=tracker)
+            eb_s = sobel_edge(eb_b, tracker=tracker)
+            eb_bin = binarization(eb_s, thresh=40, tracker=tracker)
+            eb_cnts = find_contours(eb_bin, tracker=tracker)
+
+            # Find the widest horizontal contour (eyebrow shape)
+            best_eb = None
+            best_w = 0
+            for cnt in eb_cnts:
+                x_c, y_c, w_c, h_c = cv2.boundingRect(cnt)
+                if w_c / max(h_c, 1) > 1.5 and cv2.contourArea(cnt) > 20 and w_c > best_w:
+                    best_w = w_c
+                    best_eb = (x_c, y_c, w_c, h_c)
+
+            if best_eb is not None:
+                bx, by, bw, bh = best_eb
+                ec = (fx + eb_left + bx + bw // 2, fy + eb_top + by + bh // 2)
                 features[label] = ec
                 cv2.rectangle(output,
-                              (fx + ox + bx, fy + oy + by),
-                              (fx + ox + bx + bw, fy + oy + by + bh),
+                              (fx + eb_left + bx, fy + eb_top + by),
+                              (fx + eb_left + bx + bw, fy + eb_top + by + bh),
                               (128, 255, 128), 1)
                 cv2.putText(output, label,
-                            (fx + ox + bx, fy + oy + by - 5),
+                            (fx + eb_left + bx, fy + eb_top + by - 5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.35, (128, 255, 128), 1)
 
-    # --- Ears (Sobel + Contour on face sides) ---
-    ear_marker_r = max(6, int(fw * 0.02))
-    # Ears are at ~25-55% face height, on the outer edges
-    ear_top = int(fh * 0.20)
-    ear_bot = int(fh * 0.60)
-    ear_width = int(fw * 0.20)
+    # --- Ears (Sobel + Contour on face sides, bounding rectangle) ---
+    # Ears are at ~15-65% face height, on the outer edges
+    ear_top = int(fh * 0.15)
+    ear_bot = int(fh * 0.65)
+    ear_width = int(fw * 0.25)
 
     for side, label in [("left", "L-Ear"), ("right", "R-Ear")]:
         if side == "left":
@@ -678,7 +689,6 @@ def detect_facial_features(gray, face_rect, eyes_in_face, output, tracker):
             ear_roi = face_roi_gray[ear_top:ear_bot, fw - ear_width:fw]
             ear_ox = fw - ear_width
 
-        ear_found = False
         if ear_roi.shape[0] > 5 and ear_roi.shape[1] > 5:
             # Gaussian Blur + Sobel + Binarization + Contour
             ear_blur = gaussian_blur(ear_roi, ksize=5, tracker=tracker)
@@ -686,22 +696,28 @@ def detect_facial_features(gray, face_rect, eyes_in_face, output, tracker):
             ear_bin = binarization(ear_sobel, thresh=35, tracker=tracker)
             ear_cnts = find_contours(ear_bin, tracker=tracker)
 
-            # Find largest contour in ear region
             if ear_cnts:
-                best_ear = max(ear_cnts, key=cv2.contourArea)
-                if cv2.contourArea(best_ear) > 50:
-                    M_e = cv2.moments(best_ear)
-                    if M_e["m00"] > 0:
-                        ecx = int(M_e["m10"] / M_e["m00"])
-                        ecy = int(M_e["m01"] / M_e["m00"])
-                        ec = (fx + ear_ox + ecx, fy + ear_top + ecy)
+                # Merge all significant contours to find ear top-to-bottom range
+                all_pts = []
+                for cnt in ear_cnts:
+                    if cv2.contourArea(cnt) > 30:
+                        all_pts.append(cnt)
+
+                if all_pts:
+                    merged = np.vstack(all_pts)
+                    rx, ry, rw, rh = cv2.boundingRect(merged)
+                    # Only mark if bounding box is tall enough (ear is vertically elongated)
+                    if rh > ear_roi.shape[0] * 0.15 and rw > 5:
+                        ec = (fx + ear_ox + rx + rw // 2, fy + ear_top + ry + rh // 2)
                         features[label] = ec
-                        cv2.circle(output, ec, ear_marker_r, (255, 128, 0), 2)
+                        cv2.rectangle(output,
+                                      (fx + ear_ox + rx, fy + ear_top + ry),
+                                      (fx + ear_ox + rx + rw, fy + ear_top + ry + rh),
+                                      (255, 128, 0), 2)
                         cv2.putText(output, label,
-                                    (ec[0] - 20, ec[1] - ear_marker_r - 5),
+                                    (fx + ear_ox + rx, fy + ear_top + ry - 5),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.35,
                                     (255, 128, 0), 1)
-                        ear_found = True
 
         # 耳朵偵測不到就不標記
 
