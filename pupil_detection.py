@@ -1,6 +1,7 @@
 """
 人臉瞳孔偵測 (Pupil Detection)
 使用限定的影像處理工具偵測瞳孔位置並計算兩眼瞳孔中心距離。
+支援非正面人臉：低頭、側臉、斜視等姿態。
 """
 
 import sys
@@ -101,28 +102,178 @@ def reference_pt(landmarks, indices, tracker=None):
     return [(landmarks[i].x, landmarks[i].y) for i in indices]
 
 
+class FakeLandmark:
+    """簡易 landmark 結構。"""
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+
+# ---------------------------------------------------------------------------
+# 多方向人臉偵測 (處理非正面人臉)
+# ---------------------------------------------------------------------------
+
+def detect_face_multi_angle(gray):
+    """
+    嘗試多種 cascade + 多角度旋轉偵測人臉。
+    回傳 (face_rect, angle, rotated_gray) 或 None。
+    angle 為偵測到人臉時的旋轉角度 (用於後續校正)。
+    """
+    face_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+    profile_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_profileface.xml"
+    )
+
+    h, w = gray.shape[:2]
+    center = (w // 2, h // 2)
+
+    # 嘗試不同旋轉角度: 0, ±15, ±30, ±45 度
+    angles = [0, -15, 15, -30, 30, -45, 45]
+
+    for angle in angles:
+        if angle == 0:
+            rotated = gray
+        else:
+            M = cv2.getRotationMatrix2D(center, angle, 1.0)
+            rotated = cv2.warpAffine(gray, M, (w, h))
+
+        # 正面偵測
+        for sf, mn in [(1.1, 5), (1.05, 3), (1.1, 3)]:
+            faces = face_cascade.detectMultiScale(
+                rotated, scaleFactor=sf, minNeighbors=mn, minSize=(30, 30)
+            )
+            if len(faces) > 0:
+                face = max(faces, key=lambda f: f[2] * f[3])
+                return face, angle, rotated
+
+        # 側臉偵測 (左右 profile)
+        for sf, mn in [(1.1, 3), (1.05, 3)]:
+            faces = profile_cascade.detectMultiScale(
+                rotated, scaleFactor=sf, minNeighbors=mn, minSize=(30, 30)
+            )
+            if len(faces) > 0:
+                face = max(faces, key=lambda f: f[2] * f[3])
+                return face, angle, rotated
+
+            # 水平翻轉偵測另一側
+            flipped = cv2.flip(rotated, 1)
+            faces = profile_cascade.detectMultiScale(
+                flipped, scaleFactor=sf, minNeighbors=mn, minSize=(30, 30)
+            )
+            if len(faces) > 0:
+                face = max(faces, key=lambda f: f[2] * f[3])
+                fx, fy, fw, fh = face
+                # 翻轉回原始座標
+                face = (w - fx - fw, fy, fw, fh)
+                return face, angle, rotated
+
+    return None
+
+
+def detect_eyes_direct(gray):
+    """
+    Fallback: 直接偵測眼睛 (不依賴人臉偵測)。
+    回傳 [(ex, ey, ew, eh), ...] 眼睛矩形列表。
+    """
+    eye_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_eye.xml"
+    )
+    eyes = eye_cascade.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3,
+                                        minSize=(15, 15))
+    return eyes
+
+
 # ---------------------------------------------------------------------------
 # 眼部 ROI 擷取
 # ---------------------------------------------------------------------------
 
 def get_eye_roi(gray, face_rect, side="left"):
-    """根據人臉框粗略切出眼睛區域 (不依賴 landmark)。"""
+    """根據人臉框切出眼睛區域。"""
     x, y, w, h = face_rect
-    eye_h = int(h * 0.28)
+    eye_h = int(h * 0.30)
     eye_y = y + int(h * 0.18)
     if side == "left":
-        eye_x = x + int(w * 0.08)
-        eye_w = int(w * 0.42)
+        eye_x = x + int(w * 0.05)
+        eye_w = int(w * 0.45)
     else:
         eye_x = x + int(w * 0.50)
-        eye_w = int(w * 0.42)
-    # 防止越界
+        eye_w = int(w * 0.45)
     eye_x = max(0, eye_x)
     eye_y = max(0, eye_y)
     eye_w = min(eye_w, gray.shape[1] - eye_x)
     eye_h = min(eye_h, gray.shape[0] - eye_y)
     roi = gray[eye_y:eye_y + eye_h, eye_x:eye_x + eye_w]
     return roi, (eye_x, eye_y, eye_w, eye_h)
+
+
+# ---------------------------------------------------------------------------
+# 眼部透視校正 (根據兩眼偵測的傾斜角度)
+# ---------------------------------------------------------------------------
+
+def correct_eye_tilt(gray, face_rect, tracker):
+    """
+    使用眼睛 cascade 偵測兩眼位置，計算傾斜角度，
+    再用 Perspective Transform 校正眼部區域。
+    回傳校正後的灰階圖與實際使用的 face_rect。
+    """
+    fx, fy, fw, fh = face_rect
+    face_roi = gray[fy:fy + fh, fx:fx + fw]
+
+    eye_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_eye.xml"
+    )
+    eyes = eye_cascade.detectMultiScale(face_roi, scaleFactor=1.05,
+                                        minNeighbors=3, minSize=(10, 10))
+
+    if len(eyes) < 2:
+        return gray, face_rect
+
+    # 取最大的兩個眼睛
+    eyes = sorted(eyes, key=lambda e: e[2] * e[3], reverse=True)[:2]
+    # 按 x 座標排序 (左眼在左)
+    eyes = sorted(eyes, key=lambda e: e[0])
+
+    # 兩眼中心
+    left_eye_center = (fx + eyes[0][0] + eyes[0][2] // 2,
+                       fy + eyes[0][1] + eyes[0][3] // 2)
+    right_eye_center = (fx + eyes[1][0] + eyes[1][2] // 2,
+                        fy + eyes[1][1] + eyes[1][3] // 2)
+
+    # 計算傾斜角度
+    dy = right_eye_center[1] - left_eye_center[1]
+    dx = right_eye_center[0] - left_eye_center[0]
+    angle = math.degrees(math.atan2(dy, dx))
+
+    # 若傾斜角度小於 2 度則不需校正
+    if abs(angle) < 2.0:
+        return gray, face_rect
+
+    print(f"偵測到人臉傾斜 {angle:.1f}°，執行透視校正...")
+
+    # 用 Perspective Transform 校正整張圖
+    img_h, img_w = gray.shape[:2]
+    eye_mid = ((left_eye_center[0] + right_eye_center[0]) / 2,
+               (left_eye_center[1] + right_eye_center[1]) / 2)
+
+    # 構造透視變換的四點 (模擬旋轉校正)
+    cos_a = math.cos(math.radians(-angle))
+    sin_a = math.sin(math.radians(-angle))
+
+    def rotate_point(px, py, cx, cy):
+        dx, dy = px - cx, py - cy
+        return (cx + dx * cos_a - dy * sin_a, cy + dx * sin_a + dy * cos_a)
+
+    corners = [(0, 0), (img_w, 0), (img_w, img_h), (0, img_h)]
+    src_pts = [list(c) for c in corners]
+    dst_pts = [list(rotate_point(c[0], c[1], eye_mid[0], eye_mid[1]))
+               for c in corners]
+
+    corrected = perspective_transform(gray, src_pts, dst_pts, (img_w, img_h),
+                                      tracker=tracker)
+
+    return corrected, face_rect
 
 
 # ---------------------------------------------------------------------------
@@ -138,11 +289,10 @@ def detect_pupil_in_roi(roi, tracker, eye_label="eye"):
     if h < 5 or w < 5:
         return None
 
-    # 1) Gaussian Blur — 降噪 + 去除反光
+    # 1) Gaussian Blur — 降噪 + 平滑反光
     blurred = gaussian_blur(roi, ksize=7, tracker=tracker)
 
-    # 2) Binarization — 瞳孔為暗色區域，二值化分離
-    #    動態計算閾值：取 ROI 最暗 20% 的平均值作為基準
+    # 2) Binarization — 瞳孔為暗色區域，動態閾值二值化
     sorted_px = np.sort(blurred.flatten())
     dark_mean = int(sorted_px[:max(1, len(sorted_px) // 5)].mean())
     thresh = min(dark_mean + 30, 80)
@@ -154,42 +304,61 @@ def detect_pupil_in_roi(roi, tracker, eye_label="eye"):
     # 4) 合併 binary 與 edges
     combined = cv2.bitwise_or(binary, edges)
 
-    # 5) Contour — 尋找候選輪廓
+    # 5) 形態學處理去除小雜點
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
+    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel)
+
+    # 6) Contour — 尋找候選輪廓
     contours = find_contours(combined, tracker=tracker)
 
-    # 6) 從 contours 篩選最佳瞳孔候選
+    # 7) 從 contours 篩選最佳瞳孔候選
     best = None
     best_score = -1
     center_region_x = w / 2
     center_region_y = h / 2
+    max_dist = math.hypot(center_region_x, center_region_y)
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < 20:
+        if area < 15:
             continue
         ((cx, cy), radius) = cv2.minEnclosingCircle(cnt)
         if radius < 2 or radius > min(w, h) / 2:
             continue
-        # 圓度 (越接近 1 越圓)
+
+        # 圓度
         perimeter = cv2.arcLength(cnt, True)
         if perimeter == 0:
             continue
         circularity = 4 * math.pi * area / (perimeter * perimeter)
-        # 位置分數 (越靠近 ROI 中心越好)
+
+        # 面積比 (輪廓面積 vs 最小外接圓面積)
+        circle_area = math.pi * radius * radius
+        fill_ratio = area / circle_area if circle_area > 0 else 0
+
+        # 位置分數
         dist_from_center = math.hypot(cx - center_region_x, cy - center_region_y)
-        max_dist = math.hypot(center_region_x, center_region_y)
         position_score = 1 - (dist_from_center / max_dist) if max_dist > 0 else 0
+
+        # 暗度分數 (瞳孔應該是 ROI 中最暗的區域)
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.drawContours(mask, [cnt], 0, 255, -1)
+        mean_val = cv2.mean(roi, mask=mask)[0]
+        darkness_score = 1 - (mean_val / 255.0)
+
         # 綜合分數
-        score = circularity * 0.5 + position_score * 0.5
+        score = (circularity * 0.25 + fill_ratio * 0.15 +
+                 position_score * 0.30 + darkness_score * 0.30)
         if score > best_score:
             best_score = score
-            best = (int(cx), int(cy), int(radius))
+            best = (int(cx), int(cy), max(int(radius), 3))
 
-    # 7) Hough 圓偵測作為備援 / 驗證
+    # 8) Hough 圓偵測作為備援
     min_r = max(3, int(min(w, h) * 0.05))
     max_r = max(min_r + 1, int(min(w, h) * 0.45))
     circles = hough_circles(
-        blurred, dp=1.5, min_dist=w // 3,
+        blurred, dp=1.5, min_dist=max(w // 3, 10),
         param1=80, param2=18,
         min_radius=min_r, max_radius=max_r,
         tracker=tracker,
@@ -202,15 +371,37 @@ def detect_pupil_in_roi(roi, tracker, eye_label="eye"):
             cx, cy, r = c
             dist = math.hypot(cx - center_region_x, cy - center_region_y)
             pos_s = 1 - (dist / max_dist) if max_dist > 0 else 0
-            if pos_s > best_h_score:
-                best_h_score = pos_s
-                hough_best = (int(cx), int(cy), int(r))
+            # Hough 候選的暗度分數
+            mask_h = np.zeros((h, w), dtype=np.uint8)
+            cv2.circle(mask_h, (int(cx), int(cy)), max(int(r), 1), 255, -1)
+            dark_s = 1 - (cv2.mean(roi, mask=mask_h)[0] / 255.0)
+            h_score = pos_s * 0.5 + dark_s * 0.5
+            if h_score > best_h_score:
+                best_h_score = h_score
+                hough_best = (int(cx), int(cy), max(int(r), 3))
 
     # 決策: 優先 contour，Hough 備援
     if best is not None:
         return best
     if hough_best is not None:
         return hough_best
+    return None
+
+
+def detect_pupil_in_eye_rect(gray, eye_rect, tracker, eye_label="eye"):
+    """從眼睛矩形 (eye cascade 偵測結果) 中找瞳孔。"""
+    ex, ey, ew, eh = eye_rect
+    # 縮小到眼球中央區域
+    margin_x = int(ew * 0.15)
+    margin_y = int(eh * 0.20)
+    roi = gray[ey + margin_y:ey + eh - margin_y,
+               ex + margin_x:ex + ew - margin_x]
+    if roi.shape[0] < 5 or roi.shape[1] < 5:
+        roi = gray[ey:ey + eh, ex:ex + ew]
+    result = detect_pupil_in_roi(roi, tracker, eye_label)
+    if result is not None:
+        cx, cy, r = result
+        return (cx + ex + margin_x, cy + ey + margin_y, r)
     return None
 
 
@@ -229,102 +420,135 @@ def detect_pupils(image_path):
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     output = img.copy()
+    img_h, img_w = gray.shape[:2]
 
-    # --- 人臉偵測 (使用 Haar Cascade) ---
-    face_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    )
-    # 多角度嘗試偵測
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
+    # ===== 階段 1: 多角度人臉偵測 =====
+    result = detect_face_multi_angle(gray)
 
-    if len(faces) == 0:
-        # 嘗試放寬參數
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3)
-
-    if len(faces) == 0:
-        print("錯誤: 未偵測到人臉")
-        tracker.report()
-        sys.exit(1)
-
-    # 選最大的臉
-    face = max(faces, key=lambda f: f[2] * f[3])
-    fx, fy, fw, fh = face
-
-    # --- 對眼部 ROI 做透視校正 (處理斜視/低頭) ---
-    eye_region_y = fy + int(fh * 0.15)
-    eye_region_h = int(fh * 0.35)
-    eye_region = gray[eye_region_y:eye_region_y + eye_region_h, fx:fx + fw]
-
-    if eye_region.shape[0] > 10 and eye_region.shape[1] > 10:
-        er_h, er_w = eye_region.shape[:2]
-        src_pts = [[0, 0], [er_w, 0], [er_w, er_h], [0, er_h]]
-        dst_pts = [[0, 0], [er_w, 0], [er_w, er_h], [0, er_h]]
-        eye_region_corrected = perspective_transform(
-            eye_region, src_pts, dst_pts, (er_w, er_h), tracker=tracker
-        )
-    else:
-        eye_region_corrected = eye_region
-
-    # --- 使用 Reference Pt 標記眼角作為參考 ---
-    # 利用人臉幾何比例推算眼角參考點
-    class FakeLandmark:
-        def __init__(self, x, y):
-            self.x = x
-            self.y = y
-
-    landmarks = [
-        FakeLandmark(fx + int(fw * 0.18), fy + int(fh * 0.32)),  # 左眼左角
-        FakeLandmark(fx + int(fw * 0.38), fy + int(fh * 0.32)),  # 左眼右角
-        FakeLandmark(fx + int(fw * 0.62), fy + int(fh * 0.32)),  # 右眼左角
-        FakeLandmark(fx + int(fw * 0.82), fy + int(fh * 0.32)),  # 右眼右角
-    ]
-    ref_left = reference_pt(landmarks, [0, 1], tracker=tracker)
-    ref_right = reference_pt(landmarks, [2, 3], tracker=tracker)
-
-    # --- 偵測左眼瞳孔 ---
-    left_roi, (lx, ly, lw, lh) = get_eye_roi(gray, face, side="left")
-    left_pupil = detect_pupil_in_roi(left_roi, tracker, eye_label="left")
-
-    # --- 偵測右眼瞳孔 ---
-    right_roi, (rx, ry, rw, rh) = get_eye_roi(gray, face, side="right")
-    right_pupil = detect_pupil_in_roi(right_roi, tracker, eye_label="right")
-
-    # --- Sobel 輔助驗證 (對整個眼區做 Sobel 確認邊緣一致性) ---
-    if eye_region_corrected.shape[0] > 5 and eye_region_corrected.shape[1] > 5:
-        sobel_edge(eye_region_corrected, tracker=tracker)
-
-    # --- 繪製結果 ---
     left_center_abs = None
     right_center_abs = None
+    left_radius = 0
+    right_radius = 0
 
-    if left_pupil is not None:
-        cx, cy, r = left_pupil
-        abs_cx, abs_cy = lx + cx, ly + cy
-        left_center_abs = (abs_cx, abs_cy)
-        cv2.circle(output, (abs_cx, abs_cy), r, (0, 255, 0), 2)
-        cv2.circle(output, (abs_cx, abs_cy), 2, (0, 0, 255), -1)
-        print(f"左眼瞳孔: 中心=({abs_cx}, {abs_cy}), 半徑={r}")
+    if result is not None:
+        face, angle, rotated_gray = result
+        fx, fy, fw, fh = face
+
+        if angle != 0:
+            print(f"偵測到人臉 (旋轉 {angle}° 後找到)")
+
+        # ===== 階段 2: Perspective Transform 校正傾斜 =====
+        corrected_gray, face = correct_eye_tilt(rotated_gray, face, tracker)
+
+        # ===== 階段 3: Reference Pt 建立眼角參考點 =====
+        fx, fy, fw, fh = face
+        landmarks = [
+            FakeLandmark(fx + int(fw * 0.18), fy + int(fh * 0.32)),
+            FakeLandmark(fx + int(fw * 0.38), fy + int(fh * 0.32)),
+            FakeLandmark(fx + int(fw * 0.62), fy + int(fh * 0.32)),
+            FakeLandmark(fx + int(fw * 0.82), fy + int(fh * 0.32)),
+        ]
+        ref_left = reference_pt(landmarks, [0, 1], tracker=tracker)
+        ref_right = reference_pt(landmarks, [2, 3], tracker=tracker)
+
+        # ===== 階段 4: Sobel 分析眼區邊緣特徵 =====
+        eye_region_y = fy + int(fh * 0.15)
+        eye_region_h = int(fh * 0.35)
+        eye_region_y = max(0, eye_region_y)
+        eye_region_end = min(eye_region_y + eye_region_h, corrected_gray.shape[0])
+        eye_region = corrected_gray[eye_region_y:eye_region_end, fx:fx + fw]
+        if eye_region.shape[0] > 5 and eye_region.shape[1] > 5:
+            sobel_result = sobel_edge(eye_region, tracker=tracker)
+
+        # ===== 階段 5: 偵測左右眼瞳孔 =====
+        left_roi, (lx, ly, lw, lh) = get_eye_roi(corrected_gray, face, side="left")
+        left_pupil = detect_pupil_in_roi(left_roi, tracker, eye_label="left")
+
+        right_roi, (rx, ry, rw, rh) = get_eye_roi(corrected_gray, face, side="right")
+        right_pupil = detect_pupil_in_roi(right_roi, tracker, eye_label="right")
+
+        # 若在旋轉圖上偵測，需要把座標轉回原圖
+        if angle != 0:
+            center = (img_w // 2, img_h // 2)
+            M_inv = cv2.getRotationMatrix2D(center, -angle, 1.0)
+
+            def transform_back(px, py):
+                pt = np.array([px, py, 1.0])
+                new_pt = M_inv @ pt
+                return int(new_pt[0]), int(new_pt[1])
+
+            if left_pupil is not None:
+                cx, cy, r = left_pupil
+                abs_cx, abs_cy = transform_back(lx + cx, ly + cy)
+                left_center_abs = (abs_cx, abs_cy)
+                left_radius = r
+
+            if right_pupil is not None:
+                cx, cy, r = right_pupil
+                abs_cx, abs_cy = transform_back(rx + cx, ry + cy)
+                right_center_abs = (abs_cx, abs_cy)
+                right_radius = r
+        else:
+            if left_pupil is not None:
+                cx, cy, r = left_pupil
+                left_center_abs = (lx + cx, ly + cy)
+                left_radius = r
+
+            if right_pupil is not None:
+                cx, cy, r = right_pupil
+                right_center_abs = (rx + cx, ry + cy)
+                right_radius = r
+
+    else:
+        # ===== Fallback: 直接偵測眼睛 (無人臉框) =====
+        print("未偵測到人臉框，嘗試直接偵測眼睛...")
+        eyes = detect_eyes_direct(gray)
+
+        if len(eyes) >= 2:
+            eyes = sorted(eyes, key=lambda e: e[2] * e[3], reverse=True)[:2]
+            eyes = sorted(eyes, key=lambda e: e[0])  # 左→右
+
+            left_pupil = detect_pupil_in_eye_rect(gray, eyes[0], tracker, "left")
+            right_pupil = detect_pupil_in_eye_rect(gray, eyes[1], tracker, "right")
+
+            if left_pupil is not None:
+                left_center_abs = (left_pupil[0], left_pupil[1])
+                left_radius = left_pupil[2]
+            if right_pupil is not None:
+                right_center_abs = (right_pupil[0], right_pupil[1])
+                right_radius = right_pupil[2]
+        elif len(eyes) == 1:
+            pupil = detect_pupil_in_eye_rect(gray, eyes[0], tracker, "single")
+            if pupil is not None:
+                left_center_abs = (pupil[0], pupil[1])
+                left_radius = pupil[2]
+        else:
+            print("錯誤: 未偵測到人臉或眼睛")
+            tracker.report()
+            sys.exit(1)
+
+    # ===== 繪製結果 =====
+    if left_center_abs is not None:
+        cv2.circle(output, left_center_abs, left_radius, (0, 255, 0), 2)
+        cv2.circle(output, left_center_abs, 2, (0, 0, 255), -1)
+        print(f"左眼瞳孔: 中心={left_center_abs}, 半徑={left_radius}")
     else:
         print("左眼瞳孔: 未偵測到")
 
-    if right_pupil is not None:
-        cx, cy, r = right_pupil
-        abs_cx, abs_cy = rx + cx, ry + cy
-        right_center_abs = (abs_cx, abs_cy)
-        cv2.circle(output, (abs_cx, abs_cy), r, (0, 255, 0), 2)
-        cv2.circle(output, (abs_cx, abs_cy), 2, (0, 0, 255), -1)
-        print(f"右眼瞳孔: 中心=({abs_cx}, {abs_cy}), 半徑={r}")
+    if right_center_abs is not None:
+        cv2.circle(output, right_center_abs, right_radius, (0, 255, 0), 2)
+        cv2.circle(output, right_center_abs, 2, (0, 0, 255), -1)
+        print(f"右眼瞳孔: 中心={right_center_abs}, 半徑={right_radius}")
     else:
         print("右眼瞳孔: 未偵測到")
 
-    # --- 計算距離 ---
+    # ===== 計算距離 =====
     if left_center_abs and right_center_abs:
         dist = math.hypot(
             right_center_abs[0] - left_center_abs[0],
             right_center_abs[1] - left_center_abs[1],
         )
         print(f"兩眼瞳孔中心距離: {dist:.2f} 像素")
-        # 在圖上畫連線
         cv2.line(output, left_center_abs, right_center_abs, (255, 0, 0), 1)
         mid = (
             (left_center_abs[0] + right_center_abs[0]) // 2,
@@ -335,15 +559,13 @@ def detect_pupils(image_path):
     else:
         print("無法計算距離: 至少一眼未偵測到瞳孔")
 
-    # --- 儲存結果 ---
+    # ===== 儲存結果 =====
     result_path = "result.jpg"
     cv2.imwrite(result_path, output)
     print(f"結果已儲存至: {result_path}")
 
-    # --- 輸出工具使用順序 ---
     print()
     tracker.report()
-
     return output
 
 
