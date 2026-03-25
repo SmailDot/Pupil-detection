@@ -479,15 +479,20 @@ def detect_facial_features(gray, face_rect, eyes_in_face, output, tracker):
     face_roi_gray = gray[fy:fy + fh, fx:fx + fw]
     features = {}
 
-    # --- Eyes ---
+    # --- Eyes (trim top 30% of cascade box to exclude eyebrows) ---
     if len(eyes_in_face) >= 2:
         for i, (ex, ey, ew, eh) in enumerate(eyes_in_face[:2]):
             label = "L-Eye" if i == 0 else "R-Eye"
-            center = (fx + ex + ew // 2, fy + ey + eh // 2)
+            # Trim: keep only lower 65% of cascade box (eye area only)
+            trim_top = int(eh * 0.35)
+            ey_trimmed = ey + trim_top
+            eh_trimmed = eh - trim_top
+            center = (fx + ex + ew // 2, fy + ey_trimmed + eh_trimmed // 2)
             features[label] = center
-            cv2.rectangle(output, (fx + ex, fy + ey),
-                          (fx + ex + ew, fy + ey + eh), (255, 255, 0), 1)
-            cv2.putText(output, label, (fx + ex, fy + ey - 5),
+            cv2.rectangle(output, (fx + ex, fy + ey_trimmed),
+                          (fx + ex + ew, fy + ey_trimmed + eh_trimmed),
+                          (255, 255, 0), 1)
+            cv2.putText(output, label, (fx + ex, fy + ey_trimmed - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
 
     # --- Nose (Sobel + Contour in center face region) ---
