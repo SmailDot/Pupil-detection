@@ -5,6 +5,7 @@
 隨機匯入一張人臉圖片，偵測並標記瞳孔位置。需處理以下情境：
 
 - 人物低頭、斜視等姿態變化
+- 人臉方向不一定正視前方（側臉、歪頭、旋轉角度）
 - 人物遠近距離不同
 - 瞳孔反光干擾
 
@@ -47,3 +48,19 @@ python pupil_detection.py <image_path>
 
 - 標記瞳孔的結果圖片（存為 `result.jpg`）
 - 終端輸出兩眼瞳孔中心座標與距離
+
+## 處理流程
+
+```
+輸入圖片 → 多角度人臉偵測 (正面/側臉/旋轉±45°)
+        → Perspective Transform 校正傾斜
+        → Reference Pt 建立眼角參考點
+        → Sobel 分析眼區邊緣
+        → 左右眼 ROI 擷取
+        → Gaussian Blur 降噪
+        → Binarization 二值化
+        → Canny 邊緣偵測
+        → Contour 輪廓篩選
+        → Hough 圓偵測 (備援)
+        → 繪製結果 + 計算瞳孔距離
+```
