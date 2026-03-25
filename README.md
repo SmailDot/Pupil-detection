@@ -68,6 +68,9 @@ python pupil_detection.py <image_path>
 
 ```
 輸入圖片 → 多角度人臉偵測 (正面/側臉/旋轉±45°)
+        → 判斷臉部類型 (frontal / profile)
+           若偵測到的眼睛 < 2 隻 → 自動切換 profile mode
+           使用 Sobel edge density 判斷臉朝向 (左/右)
         → Perspective Transform 校正傾斜
         → Reference Pt 建立眼角參考點
         → Sobel 分析眼區邊緣
@@ -77,11 +80,18 @@ python pupil_detection.py <image_path>
             → Connected Component Labeling (主要)
             → Canny + Contour (輔助)
             → Hough 圓偵測 (備援)
-        → 五官偵測:
-            眼睛: Haar Cascade (多分類器)
-            眉毛: 基於眼睛位置定位 + Sobel + Contour (眼睛正上方水平長條形篩選)
-            鼻子: Gaussian Blur + Sobel + Canny + Contour (鼻尖區域)
-            嘴唇: Canny + Contour (下半臉水平邊緣)
-            耳朵: Sobel + Contour (臉部兩側, 合併輪廓矩形框選)
+        → 五官偵測 (正臉/側臉分別處理):
+            正臉:
+              眼睛: Haar Cascade (多分類器)
+              眉毛: 基於眼睛中心錨點 + Sobel + Contour (眼睛上方 ~4% 臉高處)
+              鼻子: Gaussian Blur + Sobel + Canny + Contour (鼻尖區域)
+              嘴唇: Canny + Contour (下半臉水平邊緣)
+              耳朵: Sobel + Contour (臉部兩側, 合併輪廓矩形框選)
+            側臉:
+              眼睛: OTSU Binarization + Contour (臉朝向對側搜尋)
+              眉毛: 基於偵測到的眼睛上方搜尋
+              鼻子: Sobel + Canny + Contour (臉朝向側邊緣)
+              嘴唇: Canny + Contour (鼻子下方偏向臉朝向側)
+              耳朵: Sobel + Contour (臉朝向對側, 面向相機處)
         → 繪製結果 + 計算瞳孔距離
 ```
