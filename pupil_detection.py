@@ -148,9 +148,27 @@ def estimate_face_direction(face_roi_gray):
 # Multi-angle face detection
 # ---------------------------------------------------------------------------
 
+def _quick_eye_check(gray_roi):
+    """Quick check: can at least 1 eye be found in a face ROI?"""
+    for cname in ["haarcascade_eye.xml", "haarcascade_eye_tree_eyeglasses.xml"]:
+        ec = cv2.CascadeClassifier(cv2.data.haarcascades + cname)
+        if ec.empty():
+            continue
+        fh_roi = gray_roi.shape[0]
+        # Only search upper half of face for eyes
+        upper = gray_roi[:int(fh_roi * 0.55), :]
+        eyes = ec.detectMultiScale(upper, 1.1, 3, minSize=(10, 10))
+        if len(eyes) > 0:
+            return True
+    return False
+
+
 def detect_face_multi_angle(gray):
     """Try multiple cascades + rotation angles to find faces.
-    Returns (face_rect, angle, rotated_gray) or None.
+    Strategy: original angle priority order (0, ±15, ±30, ±45).
+    Frontal cascade first at each angle, then profile.
+    Frontal detections are validated by a quick eye check to reject false positives.
+    Returns (face_rect, angle, rotated_gray, face_type, face_direction) or None.
     """
     face_cascade = cv2.CascadeClassifier(
         cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
@@ -170,21 +188,28 @@ def detect_face_multi_angle(gray):
             M = cv2.getRotationMatrix2D(center, angle, 1.0)
             rotated = cv2.warpAffine(gray, M, (w, h))
 
+        # Try frontal cascade (with eye validation)
         for sf, mn in [(1.1, 5), (1.05, 3), (1.1, 3)]:
             faces = face_cascade.detectMultiScale(
                 rotated, scaleFactor=sf, minNeighbors=mn, minSize=(30, 30)
             )
             if len(faces) > 0:
                 face = max(faces, key=lambda f: f[2] * f[3])
-                return face, angle, rotated, "frontal", None
+                fx, fy, fw, fh = face
+                face_roi = rotated[fy:fy + fh, fx:fx + fw]
+                # Validate: at least 1 eye must be detectable
+                if _quick_eye_check(face_roi):
+                    return tuple(face), angle, rotated, "frontal", None
 
+        # Try profile cascade
         for sf, mn in [(1.1, 3), (1.05, 3)]:
             faces = profile_cascade.detectMultiScale(
                 rotated, scaleFactor=sf, minNeighbors=mn, minSize=(30, 30)
             )
             if len(faces) > 0:
                 face = max(faces, key=lambda f: f[2] * f[3])
-                return face, angle, rotated, "profile", "right"
+                # haarcascade_profileface detects LEFT-facing profiles
+                return tuple(face), angle, rotated, "profile", "left"
 
             flipped = cv2.flip(rotated, 1)
             faces = profile_cascade.detectMultiScale(
@@ -193,8 +218,9 @@ def detect_face_multi_angle(gray):
             if len(faces) > 0:
                 face = max(faces, key=lambda f: f[2] * f[3])
                 fx, fy, fw, fh = face
-                face = (w - fx - fw, fy, fw, fh)
-                return face, angle, rotated, "profile", "left"
+                mirrored = (w - fx - fw, fy, fw, fh)
+                # Detected in flipped image → original face looks RIGHT
+                return mirrored, angle, rotated, "profile", "right"
 
     return None
 
@@ -571,25 +597,29 @@ def _detect_mouth_contour(face_roi_gray, fx, fy, fw, fh, mry, mouth_left,
 def _detect_eyebrow_above_eye(face_roi_gray, ex, ey, ew, eh, fw,
                                fx, fy, label, output, features, tracker,
                                is_cascade_box=True):
-    """Detect eyebrow just above the eye.
-    Strategy: use eye center position + face height to define a narrow
-    search band. Eyebrow is typically 3-6% of face height above eye center.
-    is_cascade_box: True if (ex,ey,ew,eh) is from cascade (includes eyebrow),
-                    False if from contour/estimation (tight around eye only)."""
+    """Detect eyebrow using intensity-based detection.
+    For cascade boxes: The OpenCV eye cascade box includes the eyebrow in its
+    top ~35%. Search WITHIN that top portion — that IS the eyebrow region.
+    For estimated boxes: Search above the box top.
+    Strategy:
+      1. Define the search region (inside cascade box top OR above estimated box)
+      2. Gaussian Blur to smooth
+      3. Find the darkest horizontal band (row-wise mean intensity)
+      4. Threshold that band to extract dark pixels → Contour for bounding box
+    """
     fh = face_roi_gray.shape[0]
-    # Eye center in face ROI coordinates
+
     if is_cascade_box:
+        # OpenCV eye cascade top ~35% = eyebrow area → search directly within it
         trim_top = int(eh * 0.35)
-        eye_center_y = ey + trim_top + (eh - trim_top) // 2
+        eb_top = ey
+        eb_bot = ey + trim_top
     else:
-        eye_center_y = ey + eh // 2
-    # Eyebrow band: 3-8% of face height above the eye center
-    band_h = max(int(fh * 0.06), 10)
-    # Eyebrow center is ~4% of fh above eye center
-    eb_center_y = eye_center_y - max(int(fh * 0.04), 8)
-    eb_top = max(0, eb_center_y - band_h // 2)
-    eb_bot = eb_center_y + band_h // 2
-    pad_x = int(ew * 0.15)
+        # Estimated eye box: search above the box top
+        search_h = max(int(fh * 0.12), 15)
+        eb_top = max(0, ey - search_h)
+        eb_bot = ey
+    pad_x = int(ew * 0.20)
     eb_left = max(0, ex - pad_x)
     eb_right = min(fw, ex + ew + pad_x)
 
@@ -597,30 +627,67 @@ def _detect_eyebrow_above_eye(face_roi_gray, ex, ey, ew, eh, fw,
     if eb_roi.shape[0] < 5 or eb_roi.shape[1] < 5:
         return False
 
-    eb_b = gaussian_blur(eb_roi, ksize=5, tracker=tracker)
-    eb_s = sobel_edge(eb_b, tracker=tracker)
-    eb_bin = binarization(eb_s, thresh=40, tracker=tracker)
-    eb_cnts = find_contours(eb_bin, tracker=tracker)
+    # Step 1: Gaussian Blur
+    eb_blur = gaussian_blur(eb_roi, ksize=5, tracker=tracker)
+
+    # Step 2: Find darkest row band using row-wise mean intensity
+    row_means = np.mean(eb_blur, axis=1)
+    # Smooth the row profile to find a stable dark band
+    kernel_size = max(3, len(row_means) // 5)
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    if len(row_means) >= kernel_size:
+        row_smooth = np.convolve(row_means,
+                                  np.ones(kernel_size) / kernel_size, mode='same')
+    else:
+        row_smooth = row_means
+
+    # Find the darkest row
+    darkest_row = int(np.argmin(row_smooth))
+
+    # Step 3: Extract a band around the darkest row
+    band_half = max(int(fh * 0.015), 3)
+    band_top = max(0, darkest_row - band_half)
+    band_bot = min(eb_roi.shape[0], darkest_row + band_half + 1)
+    band = eb_blur[band_top:band_bot, :]
+
+    if band.shape[0] < 2 or band.shape[1] < 5:
+        return False
+
+    # Step 4: Threshold to find dark pixels (eyebrow is darker than skin)
+    # Use OTSU on the band to separate eyebrow from skin
+    band_bin = binarization(band, tracker=tracker, use_otsu=True)
+
+    # Step 5: Morphology close to connect eyebrow fragments
+    morph_k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 2))
+    band_bin = cv2.morphologyEx(band_bin, cv2.MORPH_CLOSE, morph_k)
+
+    # Step 6: Find contours
+    eb_cnts = find_contours(band_bin, tracker=tracker)
 
     best_eb = None
     best_w = 0
     for cnt in eb_cnts:
         x_c, y_c, w_c, h_c = cv2.boundingRect(cnt)
-        if w_c / max(h_c, 1) > 1.5 and cv2.contourArea(cnt) > 20 and w_c > best_w:
+        # Eyebrow should be wide and horizontal
+        if w_c > ew * 0.3 and w_c > best_w:
             best_w = w_c
             best_eb = (x_c, y_c, w_c, h_c)
 
     if best_eb is None:
         return False
+
     bx, by, bw, bh = best_eb
-    ec = (fx + eb_left + bx + bw // 2, fy + eb_top + by + bh // 2)
+    abs_top = eb_top + band_top + by
+    abs_left = eb_left + bx
+    ec = (fx + abs_left + bw // 2, fy + abs_top + bh // 2)
     features[label] = ec
     cv2.rectangle(output,
-                  (fx + eb_left + bx, fy + eb_top + by),
-                  (fx + eb_left + bx + bw, fy + eb_top + by + bh),
+                  (fx + abs_left, fy + abs_top),
+                  (fx + abs_left + bw, fy + abs_top + bh),
                   (128, 255, 128), 1)
     cv2.putText(output, label,
-                (fx + eb_left + bx, fy + eb_top + by - 5),
+                (fx + abs_left, fy + abs_top - 5),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.35, (128, 255, 128), 1)
     return True
 
@@ -991,13 +1058,66 @@ def detect_pupils(image_path):
             eyes_in_face = detect_eyes_in_face(face_roi)
 
         # Reclassify: if frontal cascade found the face but <2 eyes detected,
-        # treat as profile face
+        # treat as profile face and try to find a better face box via profile cascade
         if face_type == "frontal" and len(eyes_in_face) < 2:
             face_type = "profile"
-            face_roi_for_dir = corrected_gray[fy:fy + fh, fx:fx + fw]
-            face_direction = estimate_face_direction(face_roi_for_dir)
+            # Try profile cascade with rotations to find a better face box
+            profile_cascade = cv2.CascadeClassifier(
+                cv2.data.haarcascades + "haarcascade_profileface.xml"
+            )
+            best_profile = None
+            best_area = 0
+            best_rot_gray = corrected_gray
+            best_rot_angle = 0
+            p_h, p_w = corrected_gray.shape[:2]
+            p_center = (p_w // 2, p_h // 2)
+            for p_angle in [0, -15, 15, -30, 30]:
+                if p_angle == 0:
+                    p_rot = corrected_gray
+                else:
+                    pM = cv2.getRotationMatrix2D(p_center, p_angle, 1.0)
+                    p_rot = cv2.warpAffine(corrected_gray, pM, (p_w, p_h))
+                for sf, mn in [(1.1, 3), (1.05, 3)]:
+                    for img_to_try, direction, was_flipped in [
+                        (p_rot, "left", False),          # haarcascade detects left-facing
+                        (cv2.flip(p_rot, 1), "right", True),  # flipped → original is right-facing
+                    ]:
+                        pfaces = profile_cascade.detectMultiScale(
+                            img_to_try, sf, mn, minSize=(30, 30))
+                        if len(pfaces) > 0:
+                            pf = max(pfaces, key=lambda f: f[2] * f[3])
+                            pa = int(pf[2]) * int(pf[3])
+                            if pa > best_area:
+                                best_area = pa
+                                if was_flipped:
+                                    # Convert flipped-image coords back to original
+                                    px = p_w - pf[0] - pf[2]
+                                    best_profile = (
+                                        (px, int(pf[1]), int(pf[2]),
+                                         int(pf[3])), direction)
+                                else:
+                                    best_profile = (tuple(int(x) for x in pf),
+                                                    direction)
+                                best_rot_gray = p_rot
+                                best_rot_angle = p_angle
+
+            if best_profile and best_area > fw * fh * 0.3:
+                face = best_profile[0]
+                face_direction = best_profile[1]
+                fx, fy, fw, fh = face
+                # Update rotated_gray/corrected_gray if needed
+                if best_rot_angle != 0:
+                    corrected_gray = best_rot_gray
+                    rotated_gray = best_rot_gray
+                    angle = angle + best_rot_angle
+                print(f"Switched to profile face box: {face} "
+                      f"(looking {face_direction})")
+            else:
+                face_roi_for_dir = corrected_gray[fy:fy + fh, fx:fx + fw]
+                face_direction = estimate_face_direction(face_roi_for_dir)
+
             print(f"Only {len(eyes_in_face)} eye(s) detected, "
-                  f"switching to profile mode (looking {face_direction})")
+                  f"profile mode (looking {face_direction})")
 
         if len(eyes_in_face) >= 1:
             # Use eye cascade results as precise ROIs
