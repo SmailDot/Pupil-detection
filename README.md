@@ -100,10 +100,51 @@ python pupil_detection.py <image_path>
 
 ### face1 — 正臉
 
-![face1 result](result_face1_fixed.jpg)
+![face1 result](result_face1_latest.jpg)
 
 - 左右瞳孔均偵測，眉毛準確標記於眼睛上方
-- Inter-pupil distance: ~139 px
+- L-Pupil: (337, 267) r=15，R-Pupil: (476, 267) r=15
+- Inter-pupil distance: 139.00 px
+
+---
+
+### face2 — 正臉（男性）
+
+![face2 result](result_face2_latest.jpg)
+
+- 左右瞳孔均偵測，五官完整標記
+- L-Pupil: (454, 276) r=14，R-Pupil: (591, 295) r=10
+- Inter-pupil distance: 138.31 px
+
+---
+
+### face3 — 正臉近拍
+
+![face3 result](result_face3_latest.jpg)
+
+- 左右瞳孔均偵測，雙眼清晰
+- L-Pupil: (248, 343) r=31，R-Pupil: (551, 344) r=22
+- Inter-pupil distance: 303.00 px
+
+---
+
+### face4 — 正臉寬景
+
+![face4 result](result_face4_latest.jpg)
+
+- 左右瞳孔均偵測
+- L-Pupil: (577, 253) r=34，R-Pupil: (946, 238) r=40
+- Inter-pupil distance: 369.30 px
+
+---
+
+### face5 — 正臉（禿頭）
+
+![face5 result](result_face5_latest.jpg)
+
+- 左右瞳孔均偵測
+- L-Pupil: (326, 189) r=8，R-Pupil: (421, 183) r=10
+- Inter-pupil distance: 95.19 px
 
 ---
 
