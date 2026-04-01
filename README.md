@@ -106,6 +106,10 @@ python pupil_detection.py <image_path>
 - L-Pupil: (337, 267) r=15，R-Pupil: (476, 267) r=15
 - Inter-pupil distance: 139.00 px
 
+```
+Tool order: Reference Pt -> Reference Pt -> Sobel -> Gaussian Blur -> Binarization -> Connected Component Labeling -> Canny -> Contour -> Hough -> Gaussian Blur -> Binarization -> Connected Component Labeling -> Canny -> Contour -> Hough -> Gaussian Blur -> Sobel -> Gaussian Blur -> Canny -> Binarization -> Contour -> Gaussian Blur -> Canny -> Contour -> Gaussian Blur -> Binarization -> Contour -> Gaussian Blur -> Binarization -> Contour -> Gaussian Blur -> Sobel -> Binarization -> Contour -> Gaussian Blur -> Sobel -> Binarization -> Contour
+```
+
 ---
 
 ### face2 — 正臉（男性）
@@ -115,6 +119,10 @@ python pupil_detection.py <image_path>
 - 左右瞳孔均偵測，五官完整標記
 - L-Pupil: (454, 276) r=14，R-Pupil: (591, 295) r=10
 - Inter-pupil distance: 138.31 px
+
+```
+Tool order: Perspective Transform -> Reference Pt -> Reference Pt -> Sobel -> Gaussian Blur -> Binarization -> Connected Component Labeling -> Canny -> Contour -> Hough -> Gaussian Blur -> Binarization -> Connected Component Labeling -> Canny -> Contour -> Hough -> Gaussian Blur -> Sobel -> Gaussian Blur -> Canny -> Binarization -> Contour -> Gaussian Blur -> Canny -> Contour -> Gaussian Blur -> Binarization -> Contour -> Gaussian Blur -> Binarization -> Contour -> Gaussian Blur -> Sobel -> Binarization -> Contour -> Gaussian Blur -> Sobel -> Binarization -> Contour
+```
 
 ---
 
@@ -126,6 +134,10 @@ python pupil_detection.py <image_path>
 - L-Pupil: (248, 343) r=31，R-Pupil: (551, 344) r=22
 - Inter-pupil distance: 303.00 px
 
+```
+Tool order: Reference Pt -> Reference Pt -> Sobel -> Gaussian Blur -> Binarization -> Connected Component Labeling -> Canny -> Contour -> Hough -> Gaussian Blur -> Binarization -> Connected Component Labeling -> Canny -> Contour -> Hough -> Gaussian Blur -> Sobel -> Gaussian Blur -> Canny -> Binarization -> Contour -> Gaussian Blur -> Canny -> Contour -> Gaussian Blur -> Binarization -> Contour -> Gaussian Blur -> Binarization -> Contour -> Gaussian Blur -> Sobel -> Binarization -> Contour -> Gaussian Blur -> Sobel -> Binarization -> Contour
+```
+
 ---
 
 ### face4 — 正臉寬景
@@ -136,6 +148,10 @@ python pupil_detection.py <image_path>
 - L-Pupil: (577, 253) r=34，R-Pupil: (946, 238) r=40
 - Inter-pupil distance: 369.30 px
 
+```
+Tool order: Reference Pt -> Reference Pt -> Sobel -> Gaussian Blur -> Binarization -> Connected Component Labeling -> Canny -> Contour -> Hough -> Gaussian Blur -> Binarization -> Connected Component Labeling -> Canny -> Contour -> Hough -> Gaussian Blur -> Sobel -> Gaussian Blur -> Canny -> Binarization -> Contour -> Gaussian Blur -> Canny -> Contour -> Gaussian Blur -> Binarization -> Contour -> Gaussian Blur -> Binarization -> Contour -> Gaussian Blur -> Sobel -> Binarization -> Contour -> Gaussian Blur -> Sobel -> Binarization -> Contour
+```
+
 ---
 
 ### face5 — 正臉（禿頭）
@@ -145,6 +161,10 @@ python pupil_detection.py <image_path>
 - 左右瞳孔均偵測
 - L-Pupil: (326, 189) r=8，R-Pupil: (421, 183) r=10
 - Inter-pupil distance: 95.19 px
+
+```
+Tool order: Reference Pt -> Reference Pt -> Sobel -> Gaussian Blur -> Binarization -> Connected Component Labeling -> Canny -> Contour -> Hough -> Gaussian Blur -> Binarization -> Connected Component Labeling -> Canny -> Contour -> Hough -> Gaussian Blur -> Sobel -> Gaussian Blur -> Canny -> Binarization -> Contour -> Gaussian Blur -> Canny -> Contour -> Gaussian Blur -> Binarization -> Contour -> Gaussian Blur -> Binarization -> Contour -> Gaussian Blur -> Sobel -> Binarization -> Contour -> Gaussian Blur -> Sobel -> Binarization -> Contour
+```
 
 ---
 
@@ -161,6 +181,10 @@ python pupil_detection.py <image_path>
 - L-Pupil: (343, 314) — 位於眼睛區域
 - Nose: (563, 568) — 準確標記鼻尖
 - R-Pupil: not detected（側臉僅一眼可見，符合預期）
+
+```
+Tool order: Reference Pt -> Reference Pt -> Sobel -> Gaussian Blur -> Binarization -> Connected Component Labeling -> Canny -> Contour -> Hough -> Gaussian Blur -> Binarization -> Contour -> Gaussian Blur -> Sobel -> Gaussian Blur -> Canny -> Binarization -> Contour -> Gaussian Blur -> Canny -> Contour -> Gaussian Blur -> Sobel -> Binarization -> Contour
+```
 
 **核心修正邏輯：**
 
@@ -181,3 +205,7 @@ python pupil_detection.py <image_path>
 - L-Pupil: (402, 140), R-Pupil: (496, 64)
 - Inter-pupil distance: 120.88 px
 - 兩隻瞳孔均偵測，距離合理
+
+```
+Tool order: Reference Pt -> Reference Pt -> Sobel -> Gaussian Blur -> Binarization -> Connected Component Labeling -> Canny -> Contour -> Hough -> Gaussian Blur -> Binarization -> Connected Component Labeling -> Canny -> Contour -> Hough -> Gaussian Blur -> Binarization -> Contour -> Gaussian Blur -> Binarization -> Contour -> Gaussian Blur -> Sobel -> Gaussian Blur -> Canny -> Binarization -> Contour -> Gaussian Blur -> Canny -> Contour -> Gaussian Blur -> Sobel -> Binarization -> Contour
+```
