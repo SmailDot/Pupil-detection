@@ -799,7 +799,7 @@ def detect_facial_features(gray, face_rect, eyes_in_face, output, tracker,
     if not nose_detected:
         nose_detected = _detect_nose_contour(
             face_roi_gray, fx, fy, fh, fw,
-            int(fh * 0.50), int(fh * 0.75), int(fw * 0.30), int(fw * 0.70),
+            int(fh * 0.50), int(fh * 0.75), int(fw * 0.38), int(fw * 0.62),
             output, features, tracker
         )
 

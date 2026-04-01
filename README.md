@@ -161,6 +161,7 @@ Tool order: Reference Pt -> Reference Pt -> Sobel -> Gaussian Blur -> Binarizati
 - 左右瞳孔均偵測
 - L-Pupil: (326, 189) r=8，R-Pupil: (421, 183) r=10
 - Inter-pupil distance: 95.19 px
+- Nose: (368, 229)（鼻子修正後位置，接近雙眼中點 373.5）
 
 ```
 Tool order: Reference Pt -> Reference Pt -> Sobel -> Gaussian Blur -> Binarization -> Connected Component Labeling -> Canny -> Contour -> Hough -> Gaussian Blur -> Binarization -> Connected Component Labeling -> Canny -> Contour -> Hough -> Gaussian Blur -> Sobel -> Gaussian Blur -> Canny -> Binarization -> Contour -> Gaussian Blur -> Canny -> Contour -> Gaussian Blur -> Binarization -> Contour -> Gaussian Blur -> Binarization -> Contour -> Gaussian Blur -> Sobel -> Binarization -> Contour -> Gaussian Blur -> Sobel -> Binarization -> Contour
