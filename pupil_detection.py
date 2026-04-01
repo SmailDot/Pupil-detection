@@ -735,11 +735,14 @@ def _detect_ears(face_roi_gray, fx, fy, fw, fh, output, features, tracker,
 
 
 def detect_facial_features(gray, face_rect, eyes_in_face, output, tracker,
-                           face_type="frontal", face_direction=None):
+                           face_type="frontal", face_direction=None,
+                           profile_frontal_fallback=False):
     """Detect facial features and draw on output image.
     eyes_in_face: list of (ex, ey, ew, eh) in face ROI coordinates.
     face_type: "frontal" or "profile"
     face_direction: "left" or "right" (which way the face is looking) for profile
+    profile_frontal_fallback: True when profile cascade was rejected and the
+        original frontal cascade box is used — feature search must be extended.
     """
     fx, fy, fw, fh = face_rect
     face_roi_gray = gray[fy:fy + fh, fx:fx + fw]
@@ -747,7 +750,8 @@ def detect_facial_features(gray, face_rect, eyes_in_face, output, tracker,
 
     if face_type == "profile":
         _detect_facial_features_profile(
-            gray, face_rect, eyes_in_face, output, tracker, face_direction
+            gray, face_rect, eyes_in_face, output, tracker, face_direction,
+            extend_search=profile_frontal_fallback
         )
         return features
 
@@ -845,12 +849,16 @@ def detect_facial_features(gray, face_rect, eyes_in_face, output, tracker,
 
 
 def _detect_facial_features_profile(gray, face_rect, eyes_in_face, output,
-                                     tracker, face_direction):
+                                     tracker, face_direction,
+                                     extend_search=False):
     """Detect facial features for profile (side) faces.
     face_direction: "left" means face is looking left, "right" means looking right.
     For profile faces detected by haarcascade_profileface:
       - "right": nose/mouth protrude from the RIGHT edge of the face box
       - "left": nose/mouth protrude from the LEFT edge of the face box
+    extend_search: True when the face box is from the frontal cascade (not profile
+        cascade). The frontal box may capture the lower face (nose/chin area) rather
+        than the full face, so nose/mouth proportions and widths are adjusted.
     """
     fx, fy, fw, fh = face_rect
     face_roi_gray = gray[fy:fy + fh, fx:fx + fw]
@@ -933,15 +941,30 @@ def _detect_facial_features_profile(gray, face_rect, eyes_in_face, output,
                 )
 
     # --- Nose detection for profile ---
-    # Nose protrudes from the side the face is looking toward
-    nose_top = int(fh * 0.35)
-    nose_bot = int(fh * 0.65)
-    if nose_side == "right":
-        nose_left = int(fw * 0.50)
-        nose_right = fw
+    # Nose protrudes from the side the face is looking toward.
+    # When extend_search=True the frontal cascade detected only the lower face
+    # (nose/chin area), so the nose sits near the TOP of the box, not 35-65% down.
+    # We also widen the horizontal range because the frontal box is not aligned
+    # to the profile-cascade geometry.
+    if extend_search:
+        # Frontal box covers lower face: nose near top, wider x search
+        nose_top = int(fh * 0.10)
+        nose_bot = int(fh * 0.45)
+        if nose_side == "right":
+            nose_left = int(fw * 0.15)
+            nose_right = fw
+        else:
+            nose_left = 0
+            nose_right = int(fw * 0.85)
     else:
-        nose_left = 0
-        nose_right = int(fw * 0.50)
+        nose_top = int(fh * 0.35)
+        nose_bot = int(fh * 0.65)
+        if nose_side == "right":
+            nose_left = int(fw * 0.50)
+            nose_right = fw
+        else:
+            nose_left = 0
+            nose_right = int(fw * 0.50)
 
     nose_detected = _detect_nose_contour(
         face_roi_gray, fx, fy, fh, fw,
@@ -951,13 +974,22 @@ def _detect_facial_features_profile(gray, face_rect, eyes_in_face, output,
 
     # --- Mouth detection for profile ---
     # Mouth is below nose, shifted toward nose_side
-    mry = int(fh * 0.60)
-    if nose_side == "right":
-        m_left = int(fw * 0.30)
-        m_right = fw
+    if extend_search:
+        mry = int(fh * 0.45)
+        if nose_side == "right":
+            m_left = int(fw * 0.10)
+            m_right = fw
+        else:
+            m_left = 0
+            m_right = int(fw * 0.90)
     else:
-        m_left = 0
-        m_right = int(fw * 0.70)
+        mry = int(fh * 0.60)
+        if nose_side == "right":
+            m_left = int(fw * 0.30)
+            m_right = fw
+        else:
+            m_left = 0
+            m_right = int(fw * 0.70)
 
     _detect_mouth_contour(
         face_roi_gray, fx, fy, fw, fh, mry, m_left, m_right,
@@ -1020,6 +1052,7 @@ def detect_pupils(image_path):
     eyes_in_face = []
     face_type = "frontal"
     face_direction = None
+    profile_frontal_fallback = False
 
     if result is not None:
         face, angle, rotated_gray, face_type, face_direction = result
@@ -1102,22 +1135,75 @@ def detect_pupils(image_path):
                                 best_rot_angle = p_angle
 
             if best_profile and best_area > fw * fh * 0.3:
-                face = best_profile[0]
-                face_direction = best_profile[1]
-                fx, fy, fw, fh = face
-                # Update rotated_gray/corrected_gray if needed
-                if best_rot_angle != 0:
-                    corrected_gray = best_rot_gray
-                    rotated_gray = best_rot_gray
-                    angle = angle + best_rot_angle
-                print(f"Switched to profile face box: {face} "
-                      f"(looking {face_direction})")
+                pf_x, pf_y, pf_w, pf_h = best_profile[0]
+                pf_roi = best_rot_gray[pf_y:pf_y + pf_h, pf_x:pf_x + pf_w]
+                # Validate: profile box must contain a detectable eye.
+                # Prevents false positives from rotated-image black-corner areas.
+                if pf_roi.size > 0 and _quick_eye_check(pf_roi):
+                    face = best_profile[0]
+                    face_direction = best_profile[1]
+                    fx, fy, fw, fh = face
+                    # Update rotated_gray/corrected_gray if needed
+                    if best_rot_angle != 0:
+                        corrected_gray = best_rot_gray
+                        rotated_gray = best_rot_gray
+                        angle = angle + best_rot_angle
+                    print(f"Switched to profile face box: {face} "
+                          f"(looking {face_direction})")
+                else:
+                    print(f"Profile box {best_profile[0]} rejected "
+                          f"(no eye detected), keeping frontal box")
+                    face_roi_for_dir = corrected_gray[fy:fy + fh, fx:fx + fw]
+                    face_direction = estimate_face_direction(face_roi_for_dir)
+                    profile_frontal_fallback = True
             else:
                 face_roi_for_dir = corrected_gray[fy:fy + fh, fx:fx + fw]
                 face_direction = estimate_face_direction(face_roi_for_dir)
+                profile_frontal_fallback = True
 
             print(f"Only {len(eyes_in_face)} eye(s) detected, "
                   f"profile mode (looking {face_direction})")
+
+        # When the frontal cascade box is used for a profile face, its eyes_in_face
+        # may contain false positives (cascade detected cheek/noise area as eye).
+        # Re-detect the actual eye using a full-image search with anatomical filtering.
+        if profile_frontal_fallback and face is not None:
+            img_h_cg, img_w_cg = corrected_gray.shape[:2]
+            eye_found_full = False
+            for cname in ["haarcascade_eye.xml",
+                          "haarcascade_lefteye_2splits.xml",
+                          "haarcascade_righteye_2splits.xml"]:
+                ec = cv2.CascadeClassifier(cv2.data.haarcascades + cname)
+                if ec.empty():
+                    continue
+                eyes_full = ec.detectMultiScale(corrected_gray, 1.05, 3,
+                                                minSize=(20, 20))
+                if len(eyes_full) == 0:
+                    continue
+                # Filter: eye must be in the upper 45% of the image (not lower face)
+                valid = [e for e in eyes_full
+                         if (e[1] + e[3] // 2) < img_h_cg * 0.45]
+                # For right-facing profile: visible eye is in the LEFT half of image
+                # For left-facing profile: visible eye is in the RIGHT half
+                if face_direction == "right":
+                    valid = [e for e in valid
+                             if (e[0] + e[2] // 2) < img_w_cg * 0.55]
+                else:
+                    valid = [e for e in valid
+                             if (e[0] + e[2] // 2) >= img_w_cg * 0.45]
+                if not valid:
+                    continue
+                # Pick the largest valid eye box (most confident detection)
+                best_eye = max(valid, key=lambda e: e[2] * e[3])
+                ex_abs, ey_abs, ew_e, eh_e = [int(v) for v in best_eye]
+                # Store as face-ROI-relative coords (relative to face box fx, fy)
+                eyes_in_face = [(ex_abs - fx, ey_abs - fy, ew_e, eh_e)]
+                print(f"Full-image eye found at abs=({ex_abs},{ey_abs}) "
+                      f"for profile_frontal_fallback")
+                eye_found_full = True
+                break
+            if not eye_found_full:
+                eyes_in_face = []
 
         if len(eyes_in_face) >= 1:
             # Use eye cascade results as precise ROIs
@@ -1140,8 +1226,11 @@ def detect_pupils(image_path):
                         right_center_abs = (abs_pcx, abs_pcy)
                         right_radius = pr
 
-            # If only 1 eye found, try proportion-based for the other
-            if len(eyes_in_face) == 1 and (left_center_abs is None or right_center_abs is None):
+            # If only 1 eye found, try proportion-based for the other.
+            # Skip for profile faces — only one eye is visible by design.
+            if (face_type != "profile" and
+                    len(eyes_in_face) == 1 and
+                    (left_center_abs is None or right_center_abs is None)):
                 found_side = "left" if eyes_in_face[0][0] < fw // 2 else "right"
                 other_side = "right" if found_side == "left" else "left"
                 if other_side == "left":
@@ -1255,14 +1344,16 @@ def detect_pupils(image_path):
             rotated_color = cv2.warpAffine(output, M_rot, (img_w, img_h))
             detect_facial_features(
                 rotated_gray, face, eyes_in_face, rotated_color, tracker,
-                face_type=face_type, face_direction=face_direction
+                face_type=face_type, face_direction=face_direction,
+                profile_frontal_fallback=profile_frontal_fallback
             )
             M_inv_full = cv2.getRotationMatrix2D(center, -angle, 1.0)
             output = cv2.warpAffine(rotated_color, M_inv_full, (img_w, img_h))
         else:
             detect_facial_features(gray, face, eyes_in_face, output, tracker,
                                    face_type=face_type,
-                                   face_direction=face_direction)
+                                   face_direction=face_direction,
+                                   profile_frontal_fallback=profile_frontal_fallback)
 
     # ===== Draw pupil results =====
     if left_center_abs is not None:
