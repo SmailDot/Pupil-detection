@@ -169,43 +169,28 @@ Tool order: Reference Pt -> Reference Pt -> Sobel -> Gaussian Blur -> Binarizati
 
 ---
 
-### face6 — 3/4 側臉（向右）
+### face6 — 3/4 側臉（向右）- 依舊無法正確辨識正確
 
-| 修正前 | 修正後 |
-|--------|--------|
-| 鼻子標記在左側黑色背景；Nose=(278,269) | 鼻子準確落於鼻尖；Nose=(563,568) |
-| Profile cascade false positive 被接受 | 加入 `_quick_eye_check` 驗證，拒絕偽陽性 box |
-| 使用錯誤 face box → 全圖特徵錯位 | 保留 frontal box，改用全圖眼睛偵測錨定 |
 
 ![face6 result](result_face6_fixed2.jpg)
 
 - L-Pupil: (343, 314) — 位於眼睛區域
-- Nose: (563, 568) — 準確標記鼻尖
-- R-Pupil: not detected（側臉僅一眼可見，符合預期）
+- Nose: (563, 568) — 標記鼻尖
+- R-Pupil: not detected（側臉僅一眼可見，符合預期但辨別位置錯誤）
 
 ```
 Tool order: Reference Pt -> Reference Pt -> Sobel -> Gaussian Blur -> Binarization -> Connected Component Labeling -> Canny -> Contour -> Hough -> Gaussian Blur -> Binarization -> Contour -> Gaussian Blur -> Sobel -> Gaussian Blur -> Canny -> Binarization -> Contour -> Gaussian Blur -> Canny -> Contour -> Gaussian Blur -> Sobel -> Binarization -> Contour
 ```
 
-**核心修正邏輯：**
-
-1. Profile cascade 的 face box 現在須通過 `_quick_eye_check` 驗證才會被採用
-2. 驗證失敗時保留 frontal cascade box，並設 `profile_frontal_fallback=True`
-3. `profile_frontal_fallback` 模式下：
-   - 使用全圖 `haarcascade_eye` 重新找眼睛（按方向過濾），避免 false positive
-   - 鼻子搜尋比例調整（nose_top=10%~45%、x 範圍加寬）以對應 frontal box 貼近下臉的幾何
-4. Profile mode 不再嘗試估算另一隻眼睛（側臉本只有一眼）
-
 ---
 
-### face7 — 旋轉 -45° 側臉
+### face7 — 側臉 - 
 
 ![face7 result](result_face7_fixed.jpg)
 
 - Face found after rotating -45 deg
 - L-Pupil: (402, 140), R-Pupil: (496, 64)
 - Inter-pupil distance: 120.88 px
-- 兩隻瞳孔均偵測，距離合理
 
 ```
 Tool order: Reference Pt -> Reference Pt -> Sobel -> Gaussian Blur -> Binarization -> Connected Component Labeling -> Canny -> Contour -> Hough -> Gaussian Blur -> Binarization -> Connected Component Labeling -> Canny -> Contour -> Hough -> Gaussian Blur -> Binarization -> Contour -> Gaussian Blur -> Binarization -> Contour -> Gaussian Blur -> Sobel -> Gaussian Blur -> Canny -> Binarization -> Contour -> Gaussian Blur -> Canny -> Contour -> Gaussian Blur -> Sobel -> Binarization -> Contour
